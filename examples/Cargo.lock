@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "linera-base"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "linera-chain"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-graphql",
  "async-trait",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "linera-core"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "linera-ethereum"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "linera-execution"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "linera-sdk"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3303,7 +3303,7 @@ dependencies = [
 
 [[package]]
 name = "linera-sdk-derive"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro2",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "linera-storage"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "bcs",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "linera-version"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "linera-views"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -3380,7 +3380,7 @@ dependencies = [
 
 [[package]]
 name = "linera-views-derive"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "cfg_aliases",
  "proc-macro2",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "linera-witty"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "cfg_aliases",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "linera-witty-macros"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "cfg_aliases",
  "heck 0.4.1",
