@@ -164,8 +164,6 @@ pub enum ExecutionError {
     ExcessiveRead,
     #[error("Excessive number of bytes written to storage")]
     ExcessiveWrite,
-    #[error("Block execution required too much fuel")]
-    MaximumFuelExceeded,
     #[error("Serialized size of the executed block exceeds limit")]
     ExecutedBlockTooLarge,
     #[error("Runtime failed to respond to application")]
