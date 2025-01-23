@@ -3,11 +3,14 @@
 
 //! Implementations of the custom traits for the [`Result`] type.
 
+use std::borrow::Cow;
+
+use frunk::{hlist, hlist_pat, HCons, HList};
+
 use crate::{
     GuestPointer, InstanceWithMemory, JoinFlatLayouts, Layout, Memory, Merge, Runtime,
     RuntimeError, RuntimeMemory, WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, hlist_pat, HCons};
 
 impl<T, E> WitType for Result<T, E>
 where
@@ -34,6 +37,16 @@ where
     };
 
     type Layout = HCons<i8, <T::Layout as Merge<E::Layout>>::Output>;
+    type Dependencies = HList![T, E];
+
+    fn wit_type_name() -> Cow<'static, str> {
+        format!("result<{}, {}>", T::wit_type_name(), E::wit_type_name()).into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        // The native `result` type doesn't need to be declared
+        "".into()
+    }
 }
 
 impl<T, E> WitLoad for Result<T, E>

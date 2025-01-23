@@ -5,158 +5,189 @@
 
 mod state;
 
-use async_trait::async_trait;
 use linera_sdk::{
-    base::{ChannelName, Destination, SessionId, WithContractAbi},
-    contract::system_api,
-    ApplicationCallResult, CalleeContext, Contract, ExecutionResult, MessageContext,
-    OperationContext, SessionCallResult, ViewStateStorage,
+    base::{ChainId, ChannelName, Destination, MessageId, WithContractAbi},
+    views::{RootView, View},
+    Contract, ContractRuntime,
 };
-use linera_views::views::ViewError;
-use social::{Key, Message, Operation, OwnPost};
-use state::Social;
-use thiserror::Error;
+use social::{Comment, Key, Message, Operation, OwnPost, Post, SocialAbi};
+use state::SocialState;
 
 /// The channel name the application uses for cross-chain messages about new posts.
 const POSTS_CHANNEL_NAME: &[u8] = b"posts";
-/// The number of recent posts sent in each cross-chain message.
-const RECENT_POSTS: usize = 10;
 
-linera_sdk::contract!(Social);
-
-impl WithContractAbi for Social {
-    type Abi = social::SocialAbi;
+pub struct SocialContract {
+    state: SocialState,
+    runtime: ContractRuntime<Self>,
 }
 
-#[async_trait]
-impl Contract for Social {
-    type Error = Error;
-    type Storage = ViewStateStorage<Self>;
+linera_sdk::contract!(SocialContract);
 
-    async fn initialize(
-        &mut self,
-        _context: &OperationContext,
-        _argument: (),
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        Ok(ExecutionResult::default())
+impl WithContractAbi for SocialContract {
+    type Abi = SocialAbi;
+}
+
+impl Contract for SocialContract {
+    type Message = Message;
+    type InstantiationArgument = ();
+    type Parameters = ();
+
+    async fn load(runtime: ContractRuntime<Self>) -> Self {
+        let state = SocialState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        SocialContract { state, runtime }
     }
 
-    async fn execute_operation(
-        &mut self,
-        _context: &OperationContext,
-        operation: Operation,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        match operation {
-            Operation::RequestSubscribe(chain_id) => {
-                Ok(ExecutionResult::default().with_message(chain_id, Message::RequestSubscribe))
-            }
-            Operation::RequestUnsubscribe(chain_id) => {
-                Ok(ExecutionResult::default().with_message(chain_id, Message::RequestUnsubscribe))
-            }
-            Operation::Post(text) => self.execute_post_operation(text).await,
-        }
+    async fn instantiate(&mut self, _argument: ()) {
+        // Validate that the application parameters were configured correctly.
+        self.runtime.application_parameters();
     }
 
-    async fn execute_message(
-        &mut self,
-        context: &MessageContext,
-        message: Message,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        let mut result = ExecutionResult::default();
+    async fn execute_operation(&mut self, operation: Operation) -> Self::Response {
+        let (destination, message) = match operation {
+            Operation::Subscribe { chain_id } => (chain_id.into(), Message::Subscribe),
+            Operation::Unsubscribe { chain_id } => (chain_id.into(), Message::Unsubscribe),
+            Operation::Post { text, image_url } => {
+                self.execute_post_operation(text, image_url).await
+            }
+            Operation::Like { key } => self.execute_like_operation(key).await,
+            Operation::Comment { key, comment } => {
+                self.execute_comment_operation(key, comment).await
+            }
+        };
+
+        self.runtime.send_message(destination, message);
+    }
+
+    async fn execute_message(&mut self, message: Message) {
+        let message_id = self
+            .runtime
+            .message_id()
+            .expect("Message ID has to be available when executing a message");
         match message {
-            Message::RequestSubscribe => result.subscribe.push((
+            Message::Subscribe => self.runtime.subscribe(
+                message_id.chain_id,
                 ChannelName::from(POSTS_CHANNEL_NAME.to_vec()),
-                context.message_id.chain_id,
-            )),
-            Message::RequestUnsubscribe => result.unsubscribe.push((
+            ),
+            Message::Unsubscribe => self.runtime.unsubscribe(
+                message_id.chain_id,
                 ChannelName::from(POSTS_CHANNEL_NAME.to_vec()),
-                context.message_id.chain_id,
-            )),
-            Message::Posts { count, posts } => self.execute_posts_message(context, count, posts)?,
+            ),
+            Message::Post { index, post } => self.execute_post_message(message_id, index, post),
+            Message::Like { key } => self.execute_like_message(key).await,
+            Message::Comment {
+                key,
+                chain_id,
+                comment,
+            } => self.execute_comment_message(key, chain_id, comment).await,
         }
-        Ok(result)
     }
 
-    async fn handle_application_call(
-        &mut self,
-        _context: &CalleeContext,
-        _call: (),
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<ApplicationCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        Err(Error::ApplicationCallsNotSupported)
-    }
-
-    async fn handle_session_call(
-        &mut self,
-        _context: &CalleeContext,
-        _state: Self::SessionState,
-        _call: (),
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<SessionCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        Err(Error::SessionsNotSupported)
+    async fn store(mut self) {
+        self.state.save().await.expect("Failed to save state");
     }
 }
 
-impl Social {
+impl SocialContract {
     async fn execute_post_operation(
         &mut self,
         text: String,
-    ) -> Result<ExecutionResult<Message>, Error> {
-        let timestamp = system_api::current_system_time();
-        self.own_posts.push(OwnPost { timestamp, text });
-        let count = self.own_posts.count();
-        let mut posts = vec![];
-        for index in (0..count).rev().take(RECENT_POSTS) {
-            let maybe_post = self.own_posts.get(index).await?;
-            let own_post = maybe_post
-                .expect("post with valid index missing; this is a bug in the social application!");
-            posts.push(own_post);
-        }
-        let count = count as u64;
-        let dest = Destination::Subscribers(ChannelName::from(POSTS_CHANNEL_NAME.to_vec()));
-        Ok(ExecutionResult::default().with_message(dest, Message::Posts { count, posts }))
+        image_url: Option<String>,
+    ) -> (Destination, Message) {
+        let timestamp = self.runtime.system_time();
+        let post = OwnPost {
+            timestamp,
+            text,
+            image_url,
+        };
+        let index = self.state.own_posts.count() as u64;
+        self.state.own_posts.push(post.clone());
+        (
+            ChannelName::from(POSTS_CHANNEL_NAME.to_vec()).into(),
+            Message::Post { index, post },
+        )
     }
 
-    fn execute_posts_message(
+    async fn execute_like_operation(&mut self, key: Key) -> (Destination, Message) {
+        (
+            ChannelName::from(POSTS_CHANNEL_NAME.to_vec()).into(),
+            Message::Like { key },
+        )
+    }
+
+    async fn execute_comment_operation(
         &mut self,
-        context: &MessageContext,
-        count: u64,
-        posts: Vec<OwnPost>,
-    ) -> Result<(), Error> {
-        for (index, post) in (0..count).rev().zip(posts) {
-            let key = Key {
-                timestamp: post.timestamp,
-                author: context.message_id.chain_id,
-                index,
-            };
-            self.received_posts.insert(&key, post.text)?;
-        }
-        Ok(())
+        key: Key,
+        comment: String,
+    ) -> (Destination, Message) {
+        let chain_id = self.runtime.chain_id();
+        (
+            ChannelName::from(POSTS_CHANNEL_NAME.to_vec()).into(),
+            Message::Comment {
+                key,
+                chain_id,
+                comment,
+            },
+        )
     }
-}
 
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Social application doesn't support any cross-application sessions.
-    #[error("Social application doesn't support any cross-application sessions")]
-    SessionsNotSupported,
+    fn execute_post_message(&mut self, message_id: MessageId, index: u64, post: OwnPost) {
+        let key = Key {
+            timestamp: post.timestamp,
+            author: message_id.chain_id,
+            index,
+        };
+        let new_post = Post {
+            key: key.clone(),
+            text: post.text,
+            image_url: post.image_url,
+            likes: 0,
+            comments: vec![],
+        };
 
-    /// Social application doesn't support any cross-application sessions.
-    #[error("Social application doesn't support any application calls")]
-    ApplicationCallsNotSupported,
+        self.state
+            .received_posts
+            .insert(&key, new_post)
+            .expect("Failed to insert received post");
+    }
 
-    /// View error.
-    #[error(transparent)]
-    View(#[from] ViewError),
+    async fn execute_like_message(&mut self, key: Key) {
+        let mut post = self
+            .state
+            .received_posts
+            .get(&key)
+            .await
+            .expect("Failed to retrieve post")
+            .expect("Post not found");
 
-    /// Failed to deserialize BCS bytes
-    #[error("Failed to deserialize BCS bytes")]
-    BcsError(#[from] bcs::Error),
+        post.likes += 1;
 
-    /// Failed to deserialize JSON string
-    #[error("Failed to deserialize JSON string")]
-    JsonError(#[from] serde_json::Error),
+        self.state
+            .received_posts
+            .insert(&key, post)
+            .expect("Failed to insert received post");
+    }
+
+    async fn execute_comment_message(&mut self, key: Key, chain_id: ChainId, comment: String) {
+        let mut post = self
+            .state
+            .received_posts
+            .get(&key)
+            .await
+            .expect("Failed to retrieve post")
+            .expect("Post not found");
+
+        let comment = Comment {
+            chain_id,
+            text: comment,
+        };
+
+        post.comments.push(comment);
+
+        self.state
+            .received_posts
+            .insert(&key, post)
+            .expect("Failed to insert received post");
+    }
 }

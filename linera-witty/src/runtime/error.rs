@@ -4,6 +4,7 @@
 //! Common error type for usage of different Wasm runtimes.
 
 use std::{num::TryFromIntError, string::FromUtf8Error};
+
 use thiserror::Error;
 
 /// Errors that can occur when using a Wasm runtime.
@@ -12,6 +13,10 @@ pub enum RuntimeError {
     /// Attempt to allocate a buffer larger than `i32::MAX`.
     #[error("Requested allocation size is too large")]
     AllocationTooLarge,
+
+    /// Attempt to allocate a buffer that's aligned to an invalid boundary.
+    #[error("Requested allocation alignment is invalid")]
+    InvalidAlignment,
 
     /// Call to `cabi_realloc` returned a negative value instead of a valid address.
     #[error("Memory allocation failed")]
@@ -38,34 +43,43 @@ pub enum RuntimeError {
     NotMemory,
 
     /// Attempt to load a string from a sequence of bytes that doesn't contain a UTF-8 string.
-    #[error("Failed to load string from non-UTF-8 bytes")]
+    #[error("Failed to load string from non-UTF-8 bytes: {0}")]
     InvalidString(#[from] FromUtf8Error),
 
     /// Attempt to create a `GuestPointer` from an invalid address representation.
-    #[error("Invalid address read")]
+    #[error("Invalid address read: {0}")]
     InvalidNumber(#[from] TryFromIntError),
 
     /// Attempt to load an `enum` type but the discriminant doesn't match any of the variants.
-    #[error("Unexpected variant discriminant")]
-    InvalidVariant,
+    #[error("Unexpected variant discriminant {discriminant} for `{type_name}`")]
+    InvalidVariant {
+        /// The `enum` type that failed being loaded.
+        type_name: &'static str,
+        /// The invalid discriminant that was received.
+        discriminant: i64,
+    },
+
+    /// A custom error reported by one of the Wasm host's function handlers.
+    #[error("Error reported by host function handler: {_0}")]
+    Custom(#[source] anyhow::Error),
 
     /// Wasmer runtime error.
-    #[cfg(feature = "wasmer")]
+    #[cfg(with_wasmer)]
     #[error(transparent)]
     Wasmer(#[from] wasmer::RuntimeError),
 
     /// Attempt to access an invalid memory address using Wasmer.
-    #[cfg(feature = "wasmer")]
+    #[cfg(with_wasmer)]
     #[error(transparent)]
     WasmerMemory(#[from] wasmer::MemoryAccessError),
 
     /// Wasmtime error.
-    #[cfg(feature = "wasmtime")]
+    #[cfg(with_wasmtime)]
     #[error(transparent)]
-    Wasmtime(#[from] anyhow::Error),
+    Wasmtime(anyhow::Error),
 
     /// Wasmtime trap during execution.
-    #[cfg(feature = "wasmtime")]
+    #[cfg(with_wasmtime)]
     #[error(transparent)]
     WasmtimeTrap(#[from] wasmtime::Trap),
 }

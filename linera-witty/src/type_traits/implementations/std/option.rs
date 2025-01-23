@@ -3,11 +3,14 @@
 
 //! Implementations of the custom traits for the [`Option`] type.
 
+use std::borrow::Cow;
+
+use frunk::{hlist, hlist_pat, HCons, HList, HNil};
+
 use crate::{
     GuestPointer, InstanceWithMemory, JoinFlatLayouts, Layout, Memory, Merge, Runtime,
     RuntimeError, RuntimeMemory, WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, hlist_pat, HCons, HNil};
 
 impl<T> WitType for Option<T>
 where
@@ -22,6 +25,16 @@ where
     };
 
     type Layout = HCons<i8, <HNil as Merge<T::Layout>>::Output>;
+    type Dependencies = HList![T];
+
+    fn wit_type_name() -> Cow<'static, str> {
+        format!("option<{}>", T::wit_type_name()).into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        // The native `option` type doesn't need to be declared
+        "".into()
+    }
 }
 
 impl<T> WitLoad for Option<T>

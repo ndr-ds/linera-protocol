@@ -5,52 +5,44 @@
 
 mod state;
 
-use async_graphql::{EmptySubscription, Request, Response, Schema};
-use async_trait::async_trait;
-use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, QueryContext, Service, ViewStateStorage,
-};
-use linera_views::views::ViewError;
-use social::Operation;
-use state::Social;
 use std::sync::Arc;
-use thiserror::Error;
 
-linera_sdk::service!(Social);
+use async_graphql::{EmptySubscription, Request, Response, Schema};
+use linera_sdk::{
+    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+};
+use social::Operation;
+use state::SocialState;
 
-impl WithServiceAbi for Social {
+pub struct SocialService {
+    state: Arc<SocialState>,
+}
+
+linera_sdk::service!(SocialService);
+
+impl WithServiceAbi for SocialService {
     type Abi = social::SocialAbi;
 }
 
-#[async_trait]
-impl Service for Social {
-    type Error = Error;
-    type Storage = ViewStateStorage<Self>;
+impl Service for SocialService {
+    type Parameters = ();
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
-        let schema =
-            Schema::build(self.clone(), Operation::mutation_root(), EmptySubscription).finish();
-        let response = schema.execute(request).await;
-        Ok(response)
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        let state = SocialState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        SocialService {
+            state: Arc::new(state),
+        }
     }
-}
 
-/// An error that can occur during the service execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Invalid query.
-    #[error("Invalid query")]
-    InvalidQuery(#[from] serde_json::Error),
-
-    /// Serialization error.
-    #[error(transparent)]
-    Serialization(#[from] bcs::Error),
-
-    /// View error.
-    #[error(transparent)]
-    View(#[from] ViewError),
+    async fn handle_query(&self, request: Request) -> Response {
+        let schema = Schema::build(
+            self.state.clone(),
+            Operation::mutation_root(),
+            EmptySubscription,
+        )
+        .finish();
+        schema.execute(request).await
+    }
 }

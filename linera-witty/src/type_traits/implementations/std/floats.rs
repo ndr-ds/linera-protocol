@@ -3,18 +3,31 @@
 
 //! Implementations of the custom traits for float primitives.
 
+use std::borrow::Cow;
+
+use frunk::{hlist, hlist_pat, HList};
+
 use crate::{
     GuestPointer, InstanceWithMemory, Layout, Memory, Runtime, RuntimeError, RuntimeMemory,
     WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, hlist_pat, HList};
 
 macro_rules! impl_wit_traits {
-    ($float:ty, $size:expr) => {
+    ($float:ty, $wit_name:literal, $size:expr) => {
         impl WitType for $float {
             const SIZE: u32 = $size;
 
             type Layout = HList![$float];
+            type Dependencies = HList![];
+
+            fn wit_type_name() -> Cow<'static, str> {
+                $wit_name.into()
+            }
+
+            fn wit_type_declaration() -> Cow<'static, str> {
+                // Primitive types don't need to be declared
+                "".into()
+            }
         }
 
         impl WitLoad for $float {
@@ -71,5 +84,5 @@ macro_rules! impl_wit_traits {
     };
 }
 
-impl_wit_traits!(f32, 4);
-impl_wit_traits!(f64, 8);
+impl_wit_traits!(f32, "float32", 4);
+impl_wit_traits!(f64, "float64", 8);

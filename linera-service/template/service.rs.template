@@ -2,42 +2,89 @@
 
 mod state;
 
-use self::state::Application;
-use async_trait::async_trait;
-use linera_sdk::{{base::WithServiceAbi, QueryContext, Service, ViewStateStorage}};
-use std::sync::Arc;
-use thiserror::Error;
+use async_graphql::{{EmptySubscription, Object, Schema}};
+use linera_sdk::{{
+    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+}};
 
-linera_sdk::service!(Application);
+use {module_name}::Operation;
 
-impl WithServiceAbi for Application {{
-    type Abi = {project_name}::ApplicationAbi;
+use self::state::{project_name}State;
+
+pub struct {project_name}Service {{
+    state: {project_name}State,
+    runtime: ServiceRuntime<Self>,
 }}
 
-#[async_trait]
-impl Service for Application {{
-    type Error = ServiceError;
-    type Storage = ViewStateStorage<Self>;
+linera_sdk::service!({project_name}Service);
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        _query: Self::Query,
-    ) -> Result<(), Self::Error> {{
-        Err(ServiceError::QueriesNotSupported)
+impl WithServiceAbi for {project_name}Service {{
+    type Abi = {module_name}::{project_name}Abi;
+}}
+
+impl Service for {project_name}Service {{
+    type Parameters = ();
+
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {{
+        let state = {project_name}State::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        {project_name}Service {{ state, runtime }}
+    }}
+
+    async fn handle_query(&self, query: Self::Query) -> Self::QueryResponse {{
+        Schema::build(
+            QueryRoot {{
+                value: *self.state.value.get(),
+            }},
+            Operation::mutation_root(),
+            EmptySubscription,
+        )
+        .finish()
+        .execute(query)
+        .await
     }}
 }}
 
-/// An error that can occur while querying the service.
-#[derive(Debug, Error)]
-pub enum ServiceError {{
-    /// Query not supported by the application.
-    #[error("Queries not supported by application")]
-    QueriesNotSupported,
+struct QueryRoot {{
+    value: u64,
+}}
 
-    /// Invalid query argument; could not deserialize request.
-    #[error("Invalid query argument; could not deserialize request")]
-    InvalidQuery(#[from] serde_json::Error),
+#[Object]
+impl QueryRoot {{
+    async fn value(&self) -> &u64 {{
+        &self.value
+    }}
+}}
 
-    // Add error variants here.
+#[cfg(test)]
+mod tests {{
+    use async_graphql::{{Request, Response, Value}};
+    use futures::FutureExt as _;
+    use linera_sdk::{{util::BlockingWait, views::View, Service, ServiceRuntime}};
+    use serde_json::json;
+
+    use super::{{{project_name}Service, {project_name}State}};
+
+    #[test]
+    fn query() {{
+        let value = 60u64;
+        let runtime = ServiceRuntime::<{project_name}Service>::new();
+        let mut state = {project_name}State::load(runtime.root_view_storage_context())
+            .blocking_wait()
+            .expect("Failed to read from mock key value store");
+        state.value.set(value);
+
+        let service = {project_name}Service {{ state, runtime }};
+        let request = Request::new("{{ value }}");
+
+        let response = service
+            .handle_query(request)
+            .now_or_never()
+            .expect("Query should not await anything");
+
+        let expected = Response::new(Value::from_json(json!({{"value": 60}})).unwrap());
+
+        assert_eq!(response, expected)
+    }}
 }}

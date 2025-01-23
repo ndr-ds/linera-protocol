@@ -5,17 +5,33 @@
 
 #[path = "common/test_instance.rs"]
 mod test_instance;
+#[path = "common/wit_interface_test.rs"]
+mod wit_interface_test;
 
-#[cfg(feature = "wasmer")]
-use self::test_instance::WasmerInstanceFactory;
-#[cfg(feature = "wasmtime")]
-use self::test_instance::WasmtimeInstanceFactory;
-use self::test_instance::{MockInstanceFactory, TestInstanceFactory};
-use linera_witty::{
-    wit_export, wit_import, ExportTo, Instance, Runtime, RuntimeError, RuntimeMemory,
+use std::{
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
-use std::marker::PhantomData;
+
+use insta::assert_snapshot;
+use linera_witty::{
+    wit_export,
+    wit_generation::{WitInterface, WitInterfaceWriter, WitWorldWriter},
+    wit_import, ExportTo, Instance, MockInstance, Runtime, RuntimeError, RuntimeMemory,
+};
 use test_case::test_case;
+
+#[cfg(with_wasmer)]
+use self::test_instance::WasmerInstanceFactory;
+#[cfg(with_wasmtime)]
+use self::test_instance::WasmtimeInstanceFactory;
+use self::{
+    test_instance::{MockInstanceFactory, TestInstanceFactory},
+    wit_interface_test::{ENTRYPOINT, GETTERS, OPERATIONS, SETTERS, SIMPLE_FUNCTION},
+};
 
 /// An interface to call into the test modules.
 #[wit_import(package = "witty-macros:test-modules")]
@@ -51,8 +67,8 @@ impl ExportedSimpleFunction {
 /// The host function is called from the guest, and calls the guest back through a function with
 /// the same name.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_simple_function<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -149,8 +165,8 @@ where
 /// The host functions are called from the guest, and they return values obtained by calling back
 /// the guest through functions with the same names.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_getters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -241,8 +257,8 @@ where
 /// The host functions are called from the guest, and they forward the arguments back to the guest
 /// by calling guest functions with the same names.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_setters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -333,8 +349,8 @@ where
 /// The host functions are called from the guest, and they call the guest back through functions
 /// with the same names, forwarding the arguments and retrieving the final results.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_operations<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -380,8 +396,8 @@ impl ExportedGlobalState {
 ///
 /// The final value returned from the guest must match the initial value the host sent in.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_global_state<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -398,4 +414,135 @@ where
         .expect("Failed to call guest's `entrypoint` function");
 
     assert_eq!(result, value);
+}
+
+/// Type to export a simple reentrant function while using custom user data
+pub struct ExportedSimpleFunctionWithUserData<Caller>(PhantomData<Caller>);
+
+#[wit_export(package = "witty-macros:test-modules", interface = "simple-function")]
+impl<Caller> ExportedSimpleFunctionWithUserData<Caller>
+where
+    Caller: Instance<UserData = Arc<AtomicBool>> + InstanceForImportedSimpleFunction,
+    <Caller::Runtime as Runtime>::Memory: RuntimeMemory<Caller>,
+{
+    fn simple(caller: &mut Caller) -> Result<(), RuntimeError> {
+        tracing::debug!("Before reentrant call");
+        ImportedSimpleFunction::new(&mut *caller).simple()?;
+        tracing::debug!("After reentrant call");
+        caller.user_data().store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Test global state inside a Wasm guest accessed through reentrant functions.
+///
+/// The host calls the entrypoint passing an integer argument which the guest stores in its global
+/// state. Before returning, the guest calls the host's `get-host-value` function in order to
+/// obtain the value to return. The host function calls the guest back to obtain the return value
+/// from the guest's global state.
+///
+/// The final value returned from the guest must match the initial value the host sent in.
+#[test_case(MockInstanceFactory::default(); "with a mock instance")]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::default(); "with Wasmtime"))]
+#[allow(clippy::bool_assert_comparison)]
+fn test_user_data<InstanceFactory>(mut factory: InstanceFactory)
+where
+    InstanceFactory: TestInstanceFactory,
+    InstanceFactory::Instance: Instance<UserData = Arc<AtomicBool>> + InstanceForEntrypoint,
+    <<InstanceFactory::Instance as Instance>::Runtime as Runtime>::Memory:
+        RuntimeMemory<InstanceFactory::Instance>,
+    ExportedSimpleFunctionWithUserData<InstanceFactory::Caller<'static>>:
+        ExportTo<InstanceFactory::Builder>,
+{
+    let instance = factory
+        .load_test_module::<ExportedSimpleFunctionWithUserData<_>>("reentrancy", "simple-function");
+
+    let user_data = instance.user_data().clone();
+
+    assert_eq!(user_data.load(Ordering::Relaxed), false);
+
+    Entrypoint::new(instance)
+        .entrypoint()
+        .expect("Failed to call guest's `entrypoint` function");
+
+    assert_eq!(user_data.load(Ordering::Relaxed), true);
+}
+
+/// Test the generated [`WitInterface`] implementations for the types used in this test.
+#[test_case(PhantomData::<Entrypoint<MockInstance<()>>>, ENTRYPOINT; "of_entrypoint")]
+#[test_case(
+    PhantomData::<ImportedSimpleFunction<MockInstance<()>>>, SIMPLE_FUNCTION;
+    "of_imported_simple_function"
+)]
+#[test_case(PhantomData::<ImportedGetters<MockInstance<()>>>, GETTERS; "of_imported_getters")]
+#[test_case(PhantomData::<ImportedSetters<MockInstance<()>>>, SETTERS; "of_imported_setters")]
+#[test_case(
+    PhantomData::<ImportedOperations<MockInstance<()>>>, OPERATIONS;
+    "of_imported_operations"
+)]
+#[test_case(PhantomData::<ExportedSimpleFunction>, SIMPLE_FUNCTION; "of_exported_simple_function")]
+#[test_case(PhantomData::<ExportedGetters<MockInstance<()>>>, GETTERS; "of_exported_getters")]
+#[test_case(PhantomData::<ExportedSetters<MockInstance<()>>>, SETTERS; "of_exported_setters")]
+#[test_case(
+    PhantomData::<ExportedOperations<MockInstance<()>>>, OPERATIONS;
+    "of_exported_operations"
+)]
+fn test_wit_interface<Interface>(
+    _: PhantomData<Interface>,
+    expected_snippets: (&str, &[&str], &[(&str, &str)]),
+) where
+    Interface: WitInterface,
+{
+    wit_interface_test::test_wit_interface::<Interface>(expected_snippets);
+}
+
+#[test_case(PhantomData::<Entrypoint<MockInstance<()>>>, "entrypoint"; "of_entrypoint")]
+#[test_case(
+    PhantomData::<ImportedSimpleFunction<MockInstance<()>>>, "simple_function";
+    "of_imported_simple_function"
+)]
+#[test_case(PhantomData::<ImportedGetters<MockInstance<()>>>, "getters"; "of_imported_getters")]
+#[test_case(PhantomData::<ImportedSetters<MockInstance<()>>>, "setters"; "of_imported_setters")]
+#[test_case(
+    PhantomData::<ImportedOperations<MockInstance<()>>>, "operations";
+    "of_imported_operations"
+)]
+#[test_case(PhantomData::<ExportedSimpleFunction>, "simple_function"; "of_exported_simple_function")]
+#[test_case(PhantomData::<ExportedGetters<MockInstance<()>>>, "getters"; "of_exported_getters")]
+#[test_case(PhantomData::<ExportedSetters<MockInstance<()>>>, "setters"; "of_exported_setters")]
+#[test_case(
+    PhantomData::<ExportedOperations<MockInstance<()>>>, "operations";
+    "of_exported_operations"
+)]
+fn test_wit_interface_file<Interface>(_: PhantomData<Interface>, name: &str)
+where
+    Interface: WitInterface,
+{
+    assert_snapshot!(
+        name,
+        WitInterfaceWriter::new::<Interface>()
+            .generate_file_contents()
+            .collect::<String>()
+    );
+}
+
+/// Tests the generated file contents for a WIT world containing all the interfaces used in this
+/// test.
+#[test]
+fn test_wit_world_file() {
+    assert_snapshot!(
+        WitWorldWriter::new("witty-macros:test-modules", "test-world")
+            .export::<Entrypoint<MockInstance<()>>>()
+            .export::<ImportedSimpleFunction<MockInstance<()>>>()
+            .export::<ImportedGetters<MockInstance<()>>>()
+            .export::<ImportedSetters<MockInstance<()>>>()
+            .export::<ImportedOperations<MockInstance<()>>>()
+            .import::<ExportedSimpleFunction>()
+            .import::<ExportedGetters<MockInstance<()>>>()
+            .import::<ExportedSetters<MockInstance<()>>>()
+            .import::<ExportedOperations<MockInstance<()>>>()
+            .generate_file_contents()
+            .collect::<String>()
+    );
 }

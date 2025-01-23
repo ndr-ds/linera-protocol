@@ -15,11 +15,12 @@
 //!
 //! [flattening]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#flattening
 
+use frunk::HList;
+
 use crate::{
     memory_layout::FlatLayout, primitive_types::FlatType, InstanceWithMemory, Layout, Memory,
     Runtime, RuntimeError, RuntimeMemory, WitStore, WitType,
 };
-use frunk::HList;
 
 /// Helper trait for converting from the host parameters to the guest parameters.
 ///
@@ -113,7 +114,8 @@ where
         Instance: InstanceWithMemory,
         <Instance::Runtime as Runtime>::Memory: RuntimeMemory<Instance>,
     {
-        let location = memory.allocate(Parameters::SIZE)?;
+        let location =
+            memory.allocate(Parameters::SIZE, <Parameters::Layout as Layout>::ALIGNMENT)?;
 
         parameters.store(memory, location)?;
         location.lower(memory)

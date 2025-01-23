@@ -5,14 +5,27 @@
 
 #[path = "common/test_instance.rs"]
 mod test_instance;
+#[path = "common/wit_interface_test.rs"]
+mod wit_interface_test;
 
-#[cfg(feature = "wasmer")]
-use self::test_instance::WasmerInstanceFactory;
-#[cfg(feature = "wasmtime")]
-use self::test_instance::WasmtimeInstanceFactory;
-use self::test_instance::{MockInstanceFactory, TestInstanceFactory};
-use linera_witty::{wit_export, wit_import, ExportTo, Instance, Runtime, RuntimeMemory};
+use std::marker::PhantomData;
+
+use insta::assert_snapshot;
+use linera_witty::{
+    wit_export,
+    wit_generation::{WitInterface, WitInterfaceWriter, WitWorldWriter},
+    wit_import, ExportTo, Instance, MockInstance, Runtime, RuntimeMemory,
+};
 use test_case::test_case;
+
+#[cfg(with_wasmer)]
+use self::test_instance::WasmerInstanceFactory;
+#[cfg(with_wasmtime)]
+use self::test_instance::WasmtimeInstanceFactory;
+use self::{
+    test_instance::{MockInstanceFactory, TestInstanceFactory},
+    wit_interface_test::{ENTRYPOINT, GETTERS, OPERATIONS, SETTERS, SIMPLE_FUNCTION},
+};
 
 /// An interface to call into the test modules.
 #[wit_import(package = "witty-macros:test-modules")]
@@ -32,8 +45,8 @@ impl SimpleFunction {
 
 /// Test exporting a simple function without parameters or return values.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_simple_function<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -105,8 +118,8 @@ impl Getters {
 
 /// Test exporting functions with return values.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_getters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -127,7 +140,7 @@ pub struct Setters;
 
 #[wit_export(package = "witty-macros:test-modules")]
 impl Setters {
-    #[allow(clippy::bool_assert_comparison)]
+    #[expect(clippy::bool_assert_comparison)]
     fn set_bool(value: bool) {
         assert_eq!(value, false);
     }
@@ -175,8 +188,8 @@ impl Setters {
 
 /// Test exporting functions with parameters.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_setters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -244,8 +257,8 @@ impl Operations {
 
 /// Test exporting functions with multiple parameters and return values.
 #[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_operations<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -259,4 +272,54 @@ where
     Entrypoint::new(instance)
         .entrypoint()
         .expect("Failed to execute test of imported operations");
+}
+
+/// Test the generated [`WitInterface`] implementations for the types used in this test.
+#[test_case(PhantomData::<Entrypoint<MockInstance<()>>>, ENTRYPOINT; "of_entrypoint")]
+#[test_case(PhantomData::<SimpleFunction>, SIMPLE_FUNCTION; "of_simple_function")]
+#[test_case(PhantomData::<Getters>, GETTERS; "of_getters")]
+#[test_case(PhantomData::<Setters>, SETTERS; "of_setters")]
+#[test_case(PhantomData::<Operations>, OPERATIONS; "of_operations")]
+fn test_wit_interface<Interface>(
+    _: PhantomData<Interface>,
+    expected_snippets: (&str, &[&str], &[(&str, &str)]),
+) where
+    Interface: WitInterface,
+{
+    wit_interface_test::test_wit_interface::<Interface>(expected_snippets);
+}
+
+/// Tests the generated file contents for the [`WitInterface`] implementations for the types used
+/// in this test.
+#[test_case(PhantomData::<Entrypoint<MockInstance<()>>>, "entrypoint"; "of_entrypoint")]
+#[test_case(PhantomData::<SimpleFunction>, "simple-function"; "of_simple_function")]
+#[test_case(PhantomData::<Getters>, "getters"; "of_getters")]
+#[test_case(PhantomData::<Setters>, "setters"; "of_setters")]
+#[test_case(PhantomData::<Operations>, "operations"; "of_operations")]
+fn test_wit_interface_file<Interface>(_: PhantomData<Interface>, name: &str)
+where
+    Interface: WitInterface,
+{
+    assert_snapshot!(
+        name,
+        WitInterfaceWriter::new::<Interface>()
+            .generate_file_contents()
+            .collect::<String>()
+    );
+}
+
+/// Tests the generated file contents for a WIT world containing all the interfaces used in this
+/// test.
+#[test]
+fn test_wit_world_file() {
+    assert_snapshot!(
+        WitWorldWriter::new("witty-macros:test-modules", "test-world")
+            .export::<Entrypoint<MockInstance<()>>>()
+            .import::<SimpleFunction>()
+            .import::<Getters>()
+            .import::<Setters>()
+            .import::<Operations>()
+            .generate_file_contents()
+            .collect::<String>()
+    );
 }

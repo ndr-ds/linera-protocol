@@ -2,101 +2,67 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(feature = "aws")]
-use linera_views::dynamo_db::LocalStackTestContext;
-use once_cell::sync::Lazy;
-use std::io::Write;
+#![cfg(feature = "storage-service")]
+
+mod common;
+
+use std::{env, path::PathBuf};
+
+use common::INTEGRATION_TEST_GUARD;
+use linera_client::{
+    client_options::{
+        DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS, DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
+    },
+    util::parse_secs,
+};
+use linera_service::{test_name, util::Markdown};
 use tempfile::tempdir;
-use tokio::{process::Command, sync::Mutex};
+use tokio::process::Command;
 
-/// A static lock to prevent integration tests from running in parallel.
-static INTEGRATION_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
+#[test_case::test_case(".." ; "main")]
+#[test_case::test_case("../examples/amm" ; "amm")]
+#[test_case::test_case("../examples/counter" ; "counter")]
+#[test_case::test_case("../examples/crowd-funding" ; "crowd funding")]
+#[test_case::test_case("../examples/fungible" ; "fungible")]
+#[test_case::test_case("../examples/gen-nft" ; "gen-nft")]
+#[test_case::test_case("../examples/hex-game" ; "hex-game")]
+#[test_case::test_case("../examples/native-fungible" ; "native-fungible")]
+#[test_case::test_case("../examples/non-fungible" ; "non-fungible")]
+#[test_case::test_case("../examples/matching-engine" ; "matching engine")]
+#[test_case::test_case("../examples/meta-counter" ; "meta counter")]
+#[test_case::test_case("../examples/social" ; "social")]
 #[test_log::test(tokio::test)]
-async fn test_examples_in_readme() -> std::io::Result<()> {
+async fn test_script_in_readme_with_storage_service(path: &str) -> std::io::Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {} for path {}", test_name!(), path);
 
-    let dir = tempdir().unwrap();
-    let file = std::io::BufReader::new(std::fs::File::open("../README.md")?);
-    let mut quotes = get_bash_quotes(file)?;
-    // Check that we have the expected number of examples starting with "```bash".
-    assert_eq!(quotes.len(), 1);
-    let quote = quotes.pop().unwrap();
+    let file = Markdown::new(PathBuf::from(path).join("README.md"))?;
+    let tmp_dir = tempdir()?;
+    let path = tmp_dir.path().join("test.sh");
+    let mut script = fs_err::File::create(&path)?;
+    let pause_after_linera_service = parse_secs(DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS).unwrap();
+    let pause_after_gql_mutations = parse_secs(DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS).unwrap();
+    file.extract_bash_script_to(
+        &mut script,
+        Some(pause_after_linera_service),
+        Some(pause_after_gql_mutations),
+    )?;
 
-    let mut test_script = std::fs::File::create(dir.path().join("test.sh"))?;
-    write!(&mut test_script, "{}", quote)?;
-
-    let status = Command::new("bash")
-        .current_dir("..") // root of the repo
+    let mut command = Command::new("bash");
+    command
+        // Run from the root of the repo.
+        .current_dir("..")
         .arg("-e")
         .arg("-x")
-        .arg(dir.path().join("test.sh"))
-        .status()
-        .await?;
+        .arg(script.path());
+
+    if env::var_os("RUST_LOG").is_none() {
+        // Increase log verbosity to verify that services can write to stderr.
+        command.env("RUST_LOG", "linera_execution::wasm=debug");
+    }
+
+    let status = command.status().await?;
+
     assert!(status.success());
     Ok(())
-}
-
-#[allow(clippy::while_let_on_iterator)]
-fn get_bash_quotes(reader: impl std::io::BufRead) -> std::io::Result<Vec<String>> {
-    let mut result = Vec::new();
-    let mut lines = reader.lines();
-
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if line.starts_with("```bash") {
-            let mut quote = String::new();
-            while let Some(line) = lines.next() {
-                let line = line?;
-                if line.starts_with("```") {
-                    break;
-                }
-                quote += &line;
-                quote += "\n";
-            }
-            result.push(quote);
-        }
-    }
-
-    Ok(result)
-}
-
-#[cfg(feature = "aws")]
-mod aws_test {
-    use super::*;
-
-    const ROCKS_DB_STORAGE: &str = "--storage rocksdb:server_\"$I\"_\"$J\".db";
-    const DYNAMO_DB_STORAGE: &str = "--storage dynamodb:server-\"$I\":localstack";
-
-    const BUILD: &str = "cargo build";
-    const AWS_BUILD: &str = "cargo build --features aws";
-
-    #[test_log::test(tokio::test)]
-    async fn test_examples_in_readme_with_dynamo_db() -> anyhow::Result<()> {
-        let _guard = INTEGRATION_TEST_GUARD.lock().await;
-
-        let _localstack_guard = LocalStackTestContext::new().await?;
-        let dir = tempdir().unwrap();
-        let file = std::io::BufReader::new(std::fs::File::open("../README.md")?);
-        let mut quotes = get_bash_quotes(file)?;
-        // Check that we have the expected number of examples starting with "```bash".
-        assert_eq!(quotes.len(), 1);
-        let quote = quotes.pop().unwrap();
-        assert_eq!(quote.matches(ROCKS_DB_STORAGE).count(), 1);
-        let quote = quote.replace(ROCKS_DB_STORAGE, DYNAMO_DB_STORAGE);
-        let quote = quote.replace(BUILD, AWS_BUILD);
-
-        let mut test_script = std::fs::File::create(dir.path().join("test.sh"))?;
-        write!(&mut test_script, "{}", quote)?;
-
-        let status = Command::new("bash")
-            .current_dir("..") // root of the repo
-            .arg("-e")
-            .arg("-x")
-            .arg(dir.path().join("test.sh"))
-            .status()
-            .await?;
-        assert!(status.success());
-        Ok(())
-    }
 }

@@ -3,61 +3,31 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-mod state;
-
-use self::state::MetaCounter;
 use async_graphql::{Request, Response};
-use async_trait::async_trait;
 use linera_sdk::{
     base::{ApplicationId, WithServiceAbi},
-    service::system_api,
-    QueryContext, Service, SimpleStateStorage,
+    Service, ServiceRuntime,
 };
-use std::sync::Arc;
-use thiserror::Error;
 
-linera_sdk::service!(MetaCounter);
-
-impl MetaCounter {
-    fn counter_id() -> Result<ApplicationId, Error> {
-        let parameters = system_api::current_application_parameters();
-        serde_json::from_slice(&parameters).map_err(|_| Error::Parameters)
-    }
+pub struct MetaCounterService {
+    runtime: ServiceRuntime<Self>,
 }
 
-impl WithServiceAbi for MetaCounter {
+linera_sdk::service!(MetaCounterService);
+
+impl WithServiceAbi for MetaCounterService {
     type Abi = meta_counter::MetaCounterAbi;
 }
 
-#[async_trait]
-impl Service for MetaCounter {
-    type Error = Error;
-    type Storage = SimpleStateStorage<Self>;
+impl Service for MetaCounterService {
+    type Parameters = ApplicationId<counter::CounterAbi>;
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
-        let argument = serde_json::to_vec(&request).unwrap();
-        let value = system_api::query_application(Self::counter_id()?, &argument)
-            .await
-            .map_err(|_| Error::InternalQuery)?;
-        let response = serde_json::from_slice(&value).unwrap();
-        Ok(response)
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        MetaCounterService { runtime }
     }
-}
 
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("Internal query failed")]
-    InternalQuery,
-
-    #[error("Invalid application parameters")]
-    Parameters,
-
-    /// Invalid query argument in meta-counter app: could not deserialize GraphQL request.
-    #[error("Invalid query argument in meta-counter app: could not deserialize GraphQL request.")]
-    InvalidQuery(#[from] serde_json::Error),
+    async fn handle_query(&self, request: Request) -> Response {
+        let counter_id = self.runtime.application_parameters();
+        self.runtime.query_application(counter_id, &request)
+    }
 }

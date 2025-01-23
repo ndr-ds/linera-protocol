@@ -5,65 +5,80 @@
 
 mod state;
 
-use self::state::FungibleToken;
-use async_trait::async_trait;
+use std::str::FromStr;
+
 use fungible::{
-    Account, AccountOwner, ApplicationCall, Destination, Message, Operation, SessionCall,
+    Account, FungibleResponse, FungibleTokenAbi, InitialState, Message, Operation, Parameters,
 };
 use linera_sdk::{
-    base::{Amount, ApplicationId, Owner, SessionId, WithContractAbi},
-    contract::system_api,
-    ApplicationCallResult, CalleeContext, Contract, ExecutionResult, MessageContext,
-    OperationContext, SessionCallResult, ViewStateStorage,
+    base::{AccountOwner, Amount, WithContractAbi},
+    views::{RootView, View},
+    Contract, ContractRuntime,
 };
-use std::str::FromStr;
-use thiserror::Error;
 
-linera_sdk::contract!(FungibleToken);
+use self::state::FungibleTokenState;
 
-impl WithContractAbi for FungibleToken {
-    type Abi = fungible::FungibleTokenAbi;
+pub struct FungibleTokenContract {
+    state: FungibleTokenState,
+    runtime: ContractRuntime<Self>,
 }
 
-#[async_trait]
-impl Contract for FungibleToken {
-    type Error = Error;
-    type Storage = ViewStateStorage<Self>;
+linera_sdk::contract!(FungibleTokenContract);
 
-    async fn initialize(
-        &mut self,
-        context: &OperationContext,
-        mut state: Self::InitializationArgument,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
+impl WithContractAbi for FungibleTokenContract {
+    type Abi = FungibleTokenAbi;
+}
+
+impl Contract for FungibleTokenContract {
+    type Message = Message;
+    type Parameters = Parameters;
+    type InstantiationArgument = InitialState;
+
+    async fn load(runtime: ContractRuntime<Self>) -> Self {
+        let state = FungibleTokenState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        FungibleTokenContract { state, runtime }
+    }
+
+    async fn instantiate(&mut self, mut state: Self::InstantiationArgument) {
+        // Validate that the application parameters were configured correctly.
+        let _ = self.runtime.application_parameters();
+
         // If initial accounts are empty, creator gets 1M tokens to act like a faucet.
         if state.accounts.is_empty() {
-            if let Some(owner) = context.authenticated_signer {
+            if let Some(owner) = self.runtime.authenticated_signer() {
                 state.accounts.insert(
                     AccountOwner::User(owner),
                     Amount::from_str("1000000").unwrap(),
                 );
             }
         }
-        self.initialize_accounts(state).await;
-        Ok(ExecutionResult::default())
+        self.state.initialize_accounts(state).await;
     }
 
-    async fn execute_operation(
-        &mut self,
-        context: &OperationContext,
-        operation: Self::Operation,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
+    async fn execute_operation(&mut self, operation: Self::Operation) -> Self::Response {
         match operation {
+            Operation::Balance { owner } => {
+                let balance = self.state.balance_or_default(&owner).await;
+                FungibleResponse::Balance(balance)
+            }
+
+            Operation::TickerSymbol => {
+                let params = self.runtime.application_parameters();
+                FungibleResponse::TickerSymbol(params.ticker_symbol)
+            }
+
             Operation::Transfer {
                 owner,
                 amount,
                 target_account,
             } => {
-                Self::check_account_authentication(None, context.authenticated_signer, owner)?;
-                self.debit(owner, amount).await?;
-                Ok(self
-                    .finish_transfer_to_account(amount, target_account)
-                    .await)
+                self.check_account_authentication(owner);
+                self.state.debit(owner, amount).await;
+                self.finish_transfer_to_account(amount, target_account, owner)
+                    .await;
+                FungibleResponse::Ok
             }
 
             Operation::Claim {
@@ -71,241 +86,104 @@ impl Contract for FungibleToken {
                 amount,
                 target_account,
             } => {
-                Self::check_account_authentication(
-                    None,
-                    context.authenticated_signer,
-                    source_account.owner,
-                )?;
-                self.claim(source_account, amount, target_account).await
+                self.check_account_authentication(source_account.owner);
+                self.claim(source_account, amount, target_account).await;
+                FungibleResponse::Ok
             }
         }
     }
 
-    async fn execute_message(
-        &mut self,
-        context: &MessageContext,
-        message: Message,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
+    async fn execute_message(&mut self, message: Message) {
         match message {
-            Message::Credit { owner, amount } => {
-                self.credit(owner, amount).await;
-                Ok(ExecutionResult::default())
+            Message::Credit {
+                amount,
+                target,
+                source,
+            } => {
+                let is_bouncing = self
+                    .runtime
+                    .message_is_bouncing()
+                    .expect("Message delivery status has to be available when executing a message");
+                let receiver = if is_bouncing { source } else { target };
+                self.state.credit(receiver, amount).await;
             }
             Message::Withdraw {
                 owner,
                 amount,
                 target_account,
             } => {
-                Self::check_account_authentication(None, context.authenticated_signer, owner)?;
-                self.debit(owner, amount).await?;
-                Ok(self
-                    .finish_transfer_to_account(amount, target_account)
-                    .await)
+                self.check_account_authentication(owner);
+                self.state.debit(owner, amount).await;
+                self.finish_transfer_to_account(amount, target_account, owner)
+                    .await;
             }
         }
     }
 
-    async fn handle_application_call(
-        &mut self,
-        context: &CalleeContext,
-        call: ApplicationCall,
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<ApplicationCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        match call {
-            ApplicationCall::Balance { owner } => {
-                let mut result = ApplicationCallResult::default();
-                let balance = self.balance(&owner).await;
-                result.value = balance;
-                Ok(result)
-            }
-
-            ApplicationCall::Transfer {
-                owner,
-                amount,
-                destination,
-            } => {
-                Self::check_account_authentication(
-                    context.authenticated_caller_id,
-                    context.authenticated_signer,
-                    owner,
-                )?;
-                self.debit(owner, amount).await?;
-                Ok(self
-                    .finish_transfer_to_destination(amount, destination)
-                    .await)
-            }
-
-            ApplicationCall::Claim {
-                source_account,
-                amount,
-                target_account,
-            } => {
-                Self::check_account_authentication(
-                    None,
-                    context.authenticated_signer,
-                    source_account.owner,
-                )?;
-                let execution_result = self.claim(source_account, amount, target_account).await?;
-                Ok(ApplicationCallResult {
-                    execution_result,
-                    ..Default::default()
-                })
-            }
-        }
-    }
-
-    async fn handle_session_call(
-        &mut self,
-        _context: &CalleeContext,
-        state: Self::SessionState,
-        request: SessionCall,
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<SessionCallResult<Self::Message, Amount, Self::SessionState>, Self::Error> {
-        match request {
-            SessionCall::Balance => self.handle_session_balance(state),
-            SessionCall::Transfer {
-                amount,
-                destination,
-            } => {
-                self.handle_session_transfer(state, amount, destination)
-                    .await
-            }
-        }
+    async fn store(mut self) {
+        self.state.save().await.expect("Failed to save state");
     }
 }
 
-impl FungibleToken {
+impl FungibleTokenContract {
     /// Verifies that a transfer is authenticated for this local account.
-    fn check_account_authentication(
-        authenticated_application_id: Option<ApplicationId>,
-        authenticated_signer: Option<Owner>,
-        owner: AccountOwner,
-    ) -> Result<(), Error> {
+    fn check_account_authentication(&mut self, owner: AccountOwner) {
         match owner {
-            AccountOwner::User(address) if authenticated_signer == Some(address) => Ok(()),
-            AccountOwner::Application(id) if authenticated_application_id == Some(id) => Ok(()),
-            _ => Err(Error::IncorrectAuthentication),
+            AccountOwner::User(address) => {
+                assert_eq!(
+                    self.runtime.authenticated_signer(),
+                    Some(address),
+                    "The requested transfer is not correctly authenticated."
+                )
+            }
+            AccountOwner::Application(id) => {
+                assert_eq!(
+                    self.runtime.authenticated_caller_id(),
+                    Some(id),
+                    "The requested transfer is not correctly authenticated."
+                )
+            }
         }
     }
 
-    /// Handles a session balance request sent by an application.
-    fn handle_session_balance(
-        &self,
-        balance: Amount,
-    ) -> Result<SessionCallResult<Message, Amount, Amount>, Error> {
-        let application_call_result = ApplicationCallResult {
-            value: balance,
-            execution_result: ExecutionResult::default(),
-            create_sessions: vec![],
-        };
-        let session_call_result = SessionCallResult {
-            inner: application_call_result,
-            new_state: Some(balance),
-        };
-        Ok(session_call_result)
-    }
-
-    /// Handles a transfer from a session.
-    async fn handle_session_transfer(
-        &mut self,
-        mut balance: Amount,
-        amount: Amount,
-        destination: Destination,
-    ) -> Result<SessionCallResult<Message, Amount, Amount>, Error> {
-        balance
-            .try_sub_assign(amount)
-            .map_err(|_| Error::InsufficientSessionBalance)?;
-
-        let updated_session = (balance > Amount::ZERO).then_some(balance);
-
-        Ok(SessionCallResult {
-            inner: self
-                .finish_transfer_to_destination(amount, destination)
-                .await,
-            new_state: updated_session,
-        })
-    }
-
-    async fn claim(
-        &mut self,
-        source_account: Account,
-        amount: Amount,
-        target_account: Account,
-    ) -> Result<ExecutionResult<Message>, Error> {
-        if source_account.chain_id == system_api::current_chain_id() {
-            self.debit(source_account.owner, amount).await?;
-            Ok(self
-                .finish_transfer_to_account(amount, target_account)
-                .await)
+    async fn claim(&mut self, source_account: Account, amount: Amount, target_account: Account) {
+        if source_account.chain_id == self.runtime.chain_id() {
+            self.state.debit(source_account.owner, amount).await;
+            self.finish_transfer_to_account(amount, target_account, source_account.owner)
+                .await;
         } else {
             let message = Message::Withdraw {
                 owner: source_account.owner,
                 amount,
                 target_account,
             };
-            Ok(ExecutionResult::default()
-                .with_authenticated_message(source_account.chain_id, message))
+            self.runtime
+                .prepare_message(message)
+                .with_authentication()
+                .send_to(source_account.chain_id);
         }
-    }
-
-    /// Executes the final step of a transfer where the tokens are sent to the destination.
-    async fn finish_transfer_to_destination(
-        &mut self,
-        amount: Amount,
-        destination: Destination,
-    ) -> ApplicationCallResult<Message, Amount, Amount> {
-        let mut result = ApplicationCallResult::default();
-        match destination {
-            Destination::Account(account) => {
-                result.execution_result = self.finish_transfer_to_account(amount, account).await;
-            }
-            Destination::NewSession => {
-                result.create_sessions.push(amount);
-            }
-        }
-        result
     }
 
     /// Executes the final step of a transfer where the tokens are sent to the destination.
     async fn finish_transfer_to_account(
         &mut self,
         amount: Amount,
-        account: Account,
-    ) -> ExecutionResult<Message> {
-        if account.chain_id == system_api::current_chain_id() {
-            self.credit(account.owner, amount).await;
-            ExecutionResult::default()
+        target_account: Account,
+        source: AccountOwner,
+    ) {
+        if target_account.chain_id == self.runtime.chain_id() {
+            self.state.credit(target_account.owner, amount).await;
         } else {
             let message = Message::Credit {
-                owner: account.owner,
+                target: target_account.owner,
                 amount,
+                source,
             };
-            ExecutionResult::default().with_message(account.chain_id, message)
+            self.runtime
+                .prepare_message(message)
+                .with_authentication()
+                .with_tracking()
+                .send_to(target_account.chain_id);
         }
     }
-}
-
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Insufficient balance in source account.
-    #[error("Source account does not have sufficient balance for transfer")]
-    InsufficientBalance(#[from] state::InsufficientBalanceError),
-
-    /// Insufficient balance in session.
-    #[error("Session does not have sufficient balance for transfer")]
-    InsufficientSessionBalance,
-
-    /// Requested transfer does not have permission on this account.
-    #[error("The requested transfer is not correctly authenticated.")]
-    IncorrectAuthentication,
-
-    /// Failed to deserialize BCS bytes
-    #[error("Failed to deserialize BCS bytes")]
-    BcsError(#[from] bcs::Error),
-
-    /// Failed to deserialize JSON string
-    #[error("Failed to deserialize JSON string")]
-    JsonError(#[from] serde_json::Error),
 }

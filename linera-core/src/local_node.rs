@@ -2,42 +2,49 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    data_types::{BlockHeightRange, ChainInfo, ChainInfoQuery, ChainInfoResponse},
-    node::{NotificationStream, ValidatorNode},
-    notifier::Notifier,
-    worker::{Notification, ValidatorWorker, WorkerError, WorkerState},
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
 };
-use futures::{future, lock::Mutex};
+
+use futures::{future::Either, stream, StreamExt as _, TryStreamExt as _};
 use linera_base::{
-    data_types::{ArithmeticError, BlockHeight},
-    identifiers::{ChainId, MessageId},
+    data_types::{ArithmeticError, Blob, BlockHeight, UserApplicationDescription},
+    identifiers::{BlobId, ChainId, MessageId, UserApplicationId},
 };
 use linera_chain::{
-    data_types::{Block, BlockProposal, Certificate, ExecutedBlock, HashedValue, LiteCertificate},
-    ChainManagerInfo,
+    data_types::{BlockProposal, ExecutedBlock, ProposedBlock},
+    types::{ConfirmedBlockCertificate, GenericCertificate, LiteCertificate},
+    ChainStateView,
 };
-use linera_execution::{
-    committee::ValidatorName, BytecodeLocation, Query, Response, UserApplicationDescription,
-    UserApplicationId,
-};
-use linera_storage::Store;
+use linera_execution::{committee::ValidatorName, Query, Response};
+use linera_storage::Storage;
 use linera_views::views::ViewError;
-use rand::prelude::SliceRandom;
-use std::{borrow::Cow, sync::Arc};
 use thiserror::Error;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::OwnedRwLockReadGuard;
+use tracing::{instrument, warn};
+
+use crate::{
+    data_types::{BlockHeightRange, ChainInfo, ChainInfoQuery, ChainInfoResponse},
+    notifier::Notifier,
+    worker::{ProcessableCertificate, WorkerError, WorkerState},
+};
 
 /// A local node with a single worker, typically used by clients.
-pub struct LocalNode<S> {
+pub struct LocalNode<S>
+where
+    S: Storage,
+{
     state: WorkerState<S>,
-    notifier: Notifier<Notification>,
 }
 
 /// A client to a local node.
 #[derive(Clone)]
-pub struct LocalNodeClient<S> {
-    node: Arc<Mutex<LocalNode<S>>>,
+pub struct LocalNodeClient<S>
+where
+    S: Storage,
+{
+    node: Arc<LocalNode<S>>,
 }
 
 /// Error type for the operations on a local node.
@@ -47,497 +54,293 @@ pub enum LocalNodeError {
     ArithmeticError(#[from] ArithmeticError),
 
     #[error(transparent)]
-    ViewError(#[from] linera_views::views::ViewError),
+    ViewError(ViewError),
 
     #[error("Local node operation failed: {0}")]
-    WorkerError(#[from] WorkerError),
+    WorkerError(WorkerError),
 
-    #[error(
-        "Failed to download certificates and update local node to the next height \
-         {target_next_block_height} of chain {chain_id:?}"
-    )]
-    CannotDownloadCertificates {
-        chain_id: ChainId,
-        target_next_block_height: BlockHeight,
-    },
+    #[error("Failed to read blob {blob_id:?} of chain {chain_id:?}")]
+    CannotReadLocalBlob { chain_id: ChainId, blob_id: BlobId },
 
     #[error("The local node doesn't have an active chain {0:?}")]
     InactiveChain(ChainId),
 
     #[error("The chain info response received from the local node is invalid")]
     InvalidChainInfoResponse,
+
+    #[error("Blobs not found: {0:?}")]
+    BlobsNotFound(Vec<BlobId>),
+}
+
+impl From<WorkerError> for LocalNodeError {
+    fn from(error: WorkerError) -> Self {
+        match error {
+            WorkerError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
+            error => LocalNodeError::WorkerError(error),
+        }
+    }
+}
+
+impl From<ViewError> for LocalNodeError {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
+            error => LocalNodeError::ViewError(error),
+        }
+    }
 }
 
 impl<S> LocalNodeClient<S>
 where
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    S: Storage + Clone + Send + Sync + 'static,
 {
+    #[instrument(level = "trace", skip_all)]
     pub async fn handle_block_proposal(
-        &mut self,
+        &self,
         proposal: BlockProposal,
     ) -> Result<ChainInfoResponse, LocalNodeError> {
-        let mut node = self.node.lock().await;
         // In local nodes, we can trust fully_handle_certificate to carry all actions eventually.
-        let (response, _actions) = node.state.handle_block_proposal(proposal).await?;
+        let (response, _actions) = self.node.state.handle_block_proposal(proposal).await?;
         Ok(response)
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn handle_lite_certificate(
-        &mut self,
+        &self,
         certificate: LiteCertificate<'_>,
+        notifier: &impl Notifier,
     ) -> Result<ChainInfoResponse, LocalNodeError> {
-        let mut node = self.node.lock().await;
-        let mut notifications = Vec::new();
-        let full_cert = node.state.full_certificate(certificate).await?;
-        let response = node
-            .state
-            .fully_handle_certificate_with_notifications(
-                full_cert,
-                vec![],
-                Some(&mut notifications),
-            )
-            .await?;
-        node.notifier.handle_notifications(&notifications);
-        Ok(response)
+        match self.node.state.full_certificate(certificate).await? {
+            Either::Left(confirmed) => Ok(self.handle_certificate(confirmed, notifier).await?),
+            Either::Right(validated) => Ok(self.handle_certificate(validated, notifier).await?),
+        }
     }
 
-    pub async fn handle_certificate(
-        &mut self,
-        certificate: Certificate,
-        blobs: Vec<HashedValue>,
-    ) -> Result<ChainInfoResponse, LocalNodeError> {
-        let mut node = self.node.lock().await;
-        let mut notifications = Vec::new();
-        let response = node
-            .state
-            .fully_handle_certificate_with_notifications(
-                certificate,
-                blobs,
-                Some(&mut notifications),
-            )
-            .await?;
-        node.notifier.handle_notifications(&notifications);
-        Ok(response)
+    #[instrument(level = "trace", skip_all)]
+    pub async fn handle_certificate<T>(
+        &self,
+        certificate: GenericCertificate<T>,
+        notifier: &impl Notifier,
+    ) -> Result<ChainInfoResponse, LocalNodeError>
+    where
+        T: ProcessableCertificate,
+    {
+        Ok(Box::pin(
+            self.node
+                .state
+                .fully_handle_certificate_with_notifications(certificate, notifier),
+        )
+        .await?)
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn handle_chain_info_query(
-        &mut self,
+        &self,
         query: ChainInfoQuery,
     ) -> Result<ChainInfoResponse, LocalNodeError> {
-        let node = self.node.lock().await;
         // In local nodes, we can trust fully_handle_certificate to carry all actions eventually.
-        let (response, _actions) = node.state.handle_chain_info_query(query).await?;
+        let (response, _actions) = self.node.state.handle_chain_info_query(query).await?;
         Ok(response)
     }
-
-    pub async fn subscribe(
-        &mut self,
-        chains: Vec<ChainId>,
-    ) -> Result<NotificationStream, LocalNodeError> {
-        let node = self.node.lock().await;
-        let rx = node.notifier.subscribe(chains);
-        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
-    }
 }
 
-impl<S> LocalNodeClient<S> {
+impl<S> LocalNodeClient<S>
+where
+    S: Storage,
+{
+    #[instrument(level = "trace", skip_all)]
     pub fn new(state: WorkerState<S>) -> Self {
-        let node = LocalNode {
-            state,
-            notifier: Notifier::default(),
-        };
         Self {
-            node: Arc::new(Mutex::new(node)),
+            node: Arc::new(LocalNode { state }),
         }
     }
 }
 
 impl<S> LocalNodeClient<S>
 where
-    S: Clone,
+    S: Storage + Clone,
 {
-    pub(crate) async fn storage_client(&self) -> S {
-        let node = self.node.lock().await;
-        node.state.storage_client().clone()
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) fn storage_client(&self) -> S {
+        self.node.state.storage_client().clone()
     }
 }
 
 impl<S> LocalNodeClient<S>
 where
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    S: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn stage_block_execution(
+    #[instrument(level = "trace", skip_all)]
+    pub async fn stage_block_execution(
         &self,
-        block: Block,
+        block: ProposedBlock,
     ) -> Result<(ExecutedBlock, ChainInfoResponse), LocalNodeError> {
-        let mut node = self.node.lock().await;
-        let (executed_block, info) = node.state.stage_block_execution(block).await?;
-        Ok((executed_block, info))
+        Ok(self.node.state.stage_block_execution(block).await?)
     }
 
-    async fn try_process_certificates<A>(
-        &mut self,
-        name: ValidatorName,
-        client: &mut A,
+    /// Reads blobs from storage.
+    pub async fn read_blobs_from_storage(
+        &self,
+        blob_ids: &[BlobId],
+    ) -> Result<Option<Vec<Blob>>, LocalNodeError> {
+        let storage = self.storage_client();
+        Ok(storage.read_blobs(blob_ids).await?.into_iter().collect())
+    }
+
+    /// Looks for the specified blobs in the local chain manager's locked blobs.
+    /// Returns `Ok(None)` if any of the blobs is not found.
+    pub async fn get_locked_blobs(
+        &self,
+        blob_ids: &[BlobId],
         chain_id: ChainId,
-        certificates: Vec<Certificate>,
-    ) -> Option<ChainInfo>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let mut info = None;
-        for certificate in certificates {
-            let hash = certificate.hash();
-            if !certificate.value().is_confirmed() || certificate.value().chain_id() != chain_id {
-                // The certificate is not as expected. Give up.
-                tracing::warn!("Failed to process network certificate {}", hash);
-                return info;
+    ) -> Result<Option<Vec<Blob>>, LocalNodeError> {
+        let chain = self.chain_state_view(chain_id).await?;
+        let mut blobs = Vec::new();
+        for blob_id in blob_ids {
+            match chain.manager.locked_blobs.get(blob_id).await? {
+                None => return Ok(None),
+                Some(blob) => blobs.push(blob),
             }
-            let mut result = self.handle_certificate(certificate.clone(), vec![]).await;
-            if let Err(LocalNodeError::WorkerError(WorkerError::ApplicationBytecodesNotFound(
-                locations,
-            ))) = &result
-            {
-                let chain_id = certificate.value().chain_id();
-                let mut blobs = Vec::new();
-                let maybe_blobs = future::join_all(locations.iter().map(|location| {
-                    let mut client = client.clone();
-                    async move {
-                        Self::try_download_blob_from(name, &mut client, chain_id, *location).await
-                    }
-                }))
-                .await;
-                for maybe_blob in maybe_blobs {
-                    if let Some(blob) = maybe_blob {
-                        blobs.push(blob);
-                    } else {
-                        // The certificate is not as expected. Give up.
-                        tracing::warn!("Failed to process network blob");
-                        return info;
-                    }
-                }
-                result = self.handle_certificate(certificate.clone(), blobs).await;
-            }
-            match result {
-                Ok(response) => info = Some(response.info),
-                Err(error) => {
-                    // The certificate is not as expected. Give up.
-                    tracing::warn!("Failed to process network certificate {}: {}", hash, error);
-                    return info;
-                }
-            };
         }
-        // Done with all certificates.
-        info
+        Ok(Some(blobs))
     }
 
-    pub(crate) async fn local_chain_info(
-        &mut self,
+    /// Writes the given blobs to storage if there is an appropriate blob state.
+    pub async fn store_blobs(&self, blobs: &[Blob]) -> Result<(), LocalNodeError> {
+        let storage = self.storage_client();
+        storage.maybe_write_blobs(blobs).await?;
+        Ok(())
+    }
+
+    pub async fn handle_pending_blobs(
+        &self,
         chain_id: ChainId,
-    ) -> Result<ChainInfo, LocalNodeError> {
+        blobs: Vec<Blob>,
+    ) -> Result<(), LocalNodeError> {
+        for blob in blobs {
+            self.node.state.handle_pending_blob(chain_id, blob).await?;
+        }
+        Ok(())
+    }
+
+    /// Returns a read-only view of the [`ChainStateView`] of a chain referenced by its
+    /// [`ChainId`].
+    ///
+    /// The returned view holds a lock on the chain state, which prevents the local node from
+    /// changing the state of that chain.
+    #[instrument(level = "trace", skip(self))]
+    pub async fn chain_state_view(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<OwnedRwLockReadGuard<ChainStateView<S::Context>>, LocalNodeError> {
+        Ok(self.node.state.chain_state_view(chain_id).await?)
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    pub(crate) async fn chain_info(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<Box<ChainInfo>, LocalNodeError> {
         let query = ChainInfoQuery::new(chain_id);
         Ok(self.handle_chain_info_query(query).await?.info)
     }
 
+    #[instrument(level = "trace", skip(self, query))]
     pub async fn query_application(
         &self,
         chain_id: ChainId,
-        query: &Query,
+        query: Query,
     ) -> Result<Response, LocalNodeError> {
-        let mut node = self.node.lock().await;
-        let response = node.state.query_application(chain_id, query).await?;
+        let response = self.node.state.query_application(chain_id, query).await?;
         Ok(response)
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub async fn describe_application(
         &self,
         chain_id: ChainId,
         application_id: UserApplicationId,
     ) -> Result<UserApplicationDescription, LocalNodeError> {
-        let mut node = self.node.lock().await;
-        let response = node
+        let response = self
+            .node
             .state
             .describe_application(chain_id, application_id)
             .await?;
         Ok(response)
     }
 
-    pub async fn download_certificates<A>(
-        &mut self,
-        mut validators: Vec<(ValidatorName, A)>,
-        chain_id: ChainId,
-        target_next_block_height: BlockHeight,
-    ) -> Result<ChainInfo, LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        // Sequentially try each validator in random order.
-        validators.shuffle(&mut rand::thread_rng());
-        for (name, client) in validators {
-            let info = self.local_chain_info(chain_id).await?;
-            if target_next_block_height <= info.next_block_height {
-                return Ok(info);
-            }
-            self.try_download_certificates_from(
-                name,
-                client,
-                chain_id,
-                info.next_block_height,
-                target_next_block_height,
-            )
-            .await?;
-        }
-        let info = self.local_chain_info(chain_id).await?;
-        if target_next_block_height <= info.next_block_height {
-            Ok(info)
-        } else {
-            Err(LocalNodeError::CannotDownloadCertificates {
-                chain_id,
-                target_next_block_height,
-            })
-        }
-    }
-
-    /// Downloads and stores the specified blobs, unless they are already in the cache or storage.
-    ///
-    /// Does not fail if a blob can't be downloaded; it just gets omitted from the result.
-    pub async fn read_or_download_blobs<A>(
-        &mut self,
-        validators: Vec<(ValidatorName, A)>,
-        blob_locations: impl IntoIterator<Item = (BytecodeLocation, ChainId)>,
-    ) -> Result<Vec<HashedValue>, LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let mut blobs = vec![];
-        let mut tasks = vec![];
-        let mut node = self.node.lock().await;
-        for (location, chain_id) in blob_locations {
-            if let Some(blob) = node.state.recent_value(&location.certificate_hash).await {
-                blobs.push(blob);
-            } else {
-                let validators = validators.clone();
-                let storage = node.state.storage_client().clone();
-                tasks.push(Self::read_or_download_blob(
-                    storage, validators, chain_id, location,
-                ));
-            }
-        }
-        drop(node); // Free the lock while awaiting the tasks.
-        if tasks.is_empty() {
-            return Ok(blobs);
-        }
-        let results = future::join_all(tasks).await;
-        let mut node = self.node.lock().await;
-        for result in results {
-            if let Some(blob) = result? {
-                node.state.cache_recent_value(Cow::Borrowed(&blob)).await;
-                blobs.push(blob);
-            }
-        }
-        Ok(blobs)
-    }
-
-    pub async fn read_or_download_blob<A>(
-        storage: S,
-        validators: Vec<(ValidatorName, A)>,
-        chain_id: ChainId,
-        location: BytecodeLocation,
-    ) -> Result<Option<HashedValue>, LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        match storage.read_value(location.certificate_hash).await {
-            Ok(blob) => return Ok(Some(blob)),
-            Err(ViewError::NotFound(..)) => {}
-            Err(err) => Err(err)?,
-        }
-        match Self::download_blob(validators, chain_id, location).await {
-            Some(blob) => {
-                storage.write_value(&blob).await?;
-                Ok(Some(blob))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Obtains the certificate containing the specified message.
+    #[instrument(level = "trace", skip(self))]
     pub async fn certificate_for(
-        &mut self,
+        &self,
         message_id: &MessageId,
-    ) -> Result<Certificate, LocalNodeError> {
+    ) -> Result<ConfirmedBlockCertificate, LocalNodeError> {
         let query = ChainInfoQuery::new(message_id.chain_id)
-            .with_sent_certificates_in_range(BlockHeightRange::single(message_id.height));
+            .with_sent_certificate_hashes_in_range(BlockHeightRange::single(message_id.height));
         let info = self.handle_chain_info_query(query).await?.info;
-        let certificate = info
-            .requested_sent_certificates
+        let certificates = self
+            .storage_client()
+            .read_certificates(info.requested_sent_certificate_hashes)
+            .await?;
+        let certificate = certificates
             .into_iter()
-            .find(|certificate| certificate.value().has_message(message_id))
+            .find(|certificate| certificate.has_message(message_id))
             .ok_or_else(|| {
                 ViewError::not_found("could not find certificate with message {}", message_id)
             })?;
         Ok(certificate)
     }
 
-    async fn try_download_certificates_from<A>(
-        &mut self,
-        name: ValidatorName,
-        mut client: A,
-        chain_id: ChainId,
-        start: BlockHeight,
-        stop: BlockHeight,
-    ) -> Result<(), LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let limit = u64::from(stop)
-            .checked_sub(u64::from(start))
-            .ok_or(ArithmeticError::Overflow)?;
-        let range = BlockHeightRange {
-            start,
-            limit: Some(limit),
-        };
-        let query = ChainInfoQuery::new(chain_id).with_sent_certificates_in_range(range);
-        if let Ok(response) = client.handle_chain_info_query(query).await {
-            if response.check(name).is_ok() {
-                let ChainInfo {
-                    requested_sent_certificates,
-                    ..
-                } = response.info;
-                self.try_process_certificates(
-                    name,
-                    &mut client,
-                    chain_id,
-                    requested_sent_certificates,
-                )
-                .await;
-            }
+    /// Handles any pending local cross-chain requests.
+    #[instrument(level = "trace", skip(self))]
+    pub async fn retry_pending_cross_chain_requests(
+        &self,
+        sender_chain: ChainId,
+    ) -> Result<(), LocalNodeError> {
+        let (_response, actions) = self
+            .node
+            .state
+            .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+            .await?;
+        let mut requests = VecDeque::from_iter(actions.cross_chain_requests);
+        while let Some(request) = requests.pop_front() {
+            let new_actions = self.node.state.handle_cross_chain_request(request).await?;
+            requests.extend(new_actions.cross_chain_requests);
         }
         Ok(())
     }
 
-    pub async fn synchronize_chain_state<A>(
-        &mut self,
-        validators: Vec<(ValidatorName, A)>,
-        chain_id: ChainId,
-    ) -> Result<ChainInfo, LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let futures: Vec<_> = validators
+    /// Given a list of chain IDs, returns a map that assigns to each of them the next block
+    /// height, i.e. the lowest block height that we have not processed in the local node yet.
+    ///
+    /// It makes at most `chain_worker_limit` requests to the local node in parallel.
+    pub async fn next_block_heights(
+        &self,
+        chain_ids: impl IntoIterator<Item = &ChainId>,
+        chain_worker_limit: usize,
+    ) -> Result<BTreeMap<ChainId, BlockHeight>, LocalNodeError> {
+        let futures = chain_ids
             .into_iter()
-            .map(|(name, client)| {
-                let mut node = self.clone();
-                async move {
-                    node.try_synchronize_chain_state_from(name, client, chain_id)
-                        .await
-                }
+            .map(|chain_id| async move {
+                let local_info = self.chain_info(*chain_id).await?;
+                Ok::<_, LocalNodeError>((*chain_id, local_info.next_block_height))
             })
-            .collect();
-        futures::future::join_all(futures).await;
-        let info = self.local_chain_info(chain_id).await?;
-        Ok(info)
-    }
-
-    pub async fn try_synchronize_chain_state_from<A>(
-        &mut self,
-        name: ValidatorName,
-        mut client: A,
-        chain_id: ChainId,
-    ) -> Result<(), LocalNodeError>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let local_info = self.local_chain_info(chain_id).await?;
-        let range = BlockHeightRange {
-            start: local_info.next_block_height,
-            limit: None,
-        };
-        let query = ChainInfoQuery::new(chain_id)
-            .with_sent_certificates_in_range(range)
-            .with_manager_values();
-        let info = match client.handle_chain_info_query(query).await {
-            Ok(response) if response.check(name).is_ok() => response.info,
-            Ok(_) => {
-                tracing::warn!("Ignoring invalid response from validator");
-                // Give up on this validator.
-                return Ok(());
-            }
-            Err(err) => {
-                tracing::warn!("Ignoring error from validator: {}", err);
-                return Ok(());
-            }
-        };
-        if self
-            .try_process_certificates(
-                name,
-                &mut client,
-                chain_id,
-                info.requested_sent_certificates,
-            )
+            .collect::<Vec<_>>();
+        stream::iter(futures)
+            .buffer_unordered(chain_worker_limit)
+            .try_collect()
             .await
-            .is_none()
-        {
-            return Ok(());
-        };
-        if let ChainManagerInfo::Multi(manager) = info.manager {
-            if let Some(proposal) = manager.requested_proposed {
-                if proposal.content.block.chain_id == chain_id {
-                    let owner = proposal.owner;
-                    if let Err(error) = self.handle_block_proposal(proposal).await {
-                        tracing::warn!("Skipping proposal from {}: {}", owner, error);
-                    }
-                }
-            }
-            if let Some(cert) = manager.requested_locked {
-                if cert.value().is_validated() && cert.value().chain_id() == chain_id {
-                    let hash = cert.hash();
-                    if let Err(error) = self.handle_certificate(cert, vec![]).await {
-                        tracing::warn!("Skipping certificate {}: {}", hash, error);
-                    }
-                }
-            }
-        }
+    }
+
+    pub async fn update_received_certificate_trackers(
+        &self,
+        chain_id: ChainId,
+        new_trackers: BTreeMap<ValidatorName, u64>,
+    ) -> Result<(), LocalNodeError> {
+        self.node
+            .state
+            .update_received_certificate_trackers(chain_id, new_trackers)
+            .await?;
         Ok(())
-    }
-
-    pub async fn download_blob<A>(
-        mut validators: Vec<(ValidatorName, A)>,
-        chain_id: ChainId,
-        location: BytecodeLocation,
-    ) -> Option<HashedValue>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        // Sequentially try each validator in random order.
-        validators.shuffle(&mut rand::thread_rng());
-        for (name, mut client) in validators {
-            if let Some(blob) =
-                Self::try_download_blob_from(name, &mut client, chain_id, location).await
-            {
-                return Some(blob);
-            }
-        }
-        None
-    }
-
-    async fn try_download_blob_from<A>(
-        name: ValidatorName,
-        client: &mut A,
-        chain_id: ChainId,
-        location: BytecodeLocation,
-    ) -> Option<HashedValue>
-    where
-        A: ValidatorNode + Send + Sync + 'static + Clone,
-    {
-        let query = ChainInfoQuery::new(chain_id).with_blob(location.certificate_hash);
-        if let Ok(response) = client.handle_chain_info_query(query).await {
-            if response.check(name).is_ok() {
-                return response.info.requested_blob;
-            }
-        }
-        None
     }
 }

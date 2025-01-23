@@ -1,0 +1,8 @@
+package linera:app;
+
+interface contract-entrypoints {
+    instantiate: func(argument: list<u8>);
+    execute-operation: func(operation: list<u8>) -> list<u8>;
+    execute-message: func(message: list<u8>);
+    finalize: func();
+}

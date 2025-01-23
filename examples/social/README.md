@@ -1,5 +1,3 @@
-<!-- cargo-rdme start -->
-
 # A Social Media Example Application
 
 This example illustrates how to use channels for cross-chain messages.
@@ -19,129 +17,177 @@ new block, they can subscribe to or unsubscribe from another chain.
 There is also a `Post` operation: It creates a new post and sends it to a channel, so that
 it reaches all subscribers.
 
-There are corresponding `RequestSubscribe`, `RequestUnsubscribe` and `Posts` cross-chain
+There are corresponding `Subscribe`, `Unsubscribe` and `Posts` cross-chain
 message variants that are created when these operations are handled. The first two are
 sent directly to the chain we want to subscribe to or unsubscribe from. The latter goes
 to the channel.
 
+<!--
+TODO the following documentation involves `sleep`ing to avoid some race conditions. See:
+ - https://github.com/linera-io/linera-protocol/issues/1176
+ - https://github.com/linera-io/linera-protocol/issues/1177
+-->
+
 ## Usage
 
-To try it out, first setup a local network with two wallets, and keep it running in a
-separate terminal:
+Set up the path and the helper function.
 
 ```bash
-./scripts/run_local.sh
+PATH=$PWD/target/debug:$PATH
+source /dev/stdin <<<"$(linera net helper 2>/dev/null)"
+```
+
+Then, using the helper function defined by `linera net helper`, set up a local network
+with two wallets and define variables holding their wallet paths (`$LINERA_WALLET_0`,
+`$LINERA_WALLET_1`) and storage paths (`$LINERA_STORAGE_0`, `$LINERA_STORAGE_1`).
+
+```bash
+linera_spawn_and_read_wallet_variables \
+    linera net up \
+        --extra-wallets 1
 ```
 
 Compile the `social` example and create an application with it:
 
 ```bash
-alias linera="$PWD/target/debug/linera"
-export LINERA_WALLET1="$PWD/target/debug/wallet.json"
-export LINERA_STORAGE1="rocksdb:$(dirname "$LINERA_WALLET1")/linera.db"
-export LINERA_WALLET2="$PWD/target/debug/wallet_2.json"
-export LINERA_STORAGE2="rocksdb:$(dirname "$LINERA_WALLET2")/linera_2.db"
-
-cd examples/social && cargo build --release && cd ../..
-
-linera --wallet "$LINERA_WALLET1" --storage "$LINERA_STORAGE1" \
-  publish-and-create examples/target/wasm32-unknown-unknown/release/social_{contract,service}.wasm
+APP_ID=$(linera --with-wallet 0 project publish-and-create examples/social)
 ```
 
 This will output the new application ID, e.g.:
 
 ```rust
-e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65010000000000000001000000e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65030000000000000000000000
+e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65010000000000000000000000e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65030000000000000000000000
 ```
 
 With the `wallet show` command you can find the ID of the application creator's chain:
 
 ```bash
-linera --wallet "$LINERA_WALLET1" --storage "$LINERA_STORAGE1" wallet show
+linera --with-wallet 0 wallet show
+
+CHAIN_1=1db1936dad0717597a7743a8353c9c0191c14c3a129b258e9743aec2b4f05d03
+CHAIN_2=e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65
 ```
 
 ```rust
 e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65
 ```
 
-
 Now start a node service for each wallet, using two different ports:
 
 ```bash
-linera --wallet "$LINERA_WALLET1" --storage "$LINERA_STORAGE1" service --port 8080 &
-linera --wallet "$LINERA_WALLET2" --storage "$LINERA_STORAGE2" service --port 8081 &
+linera --with-wallet 0 service --port 8080 &
+
+# Wait for it to complete
+sleep 2
+
+linera --with-wallet 1 service --port 8081 &
+
+# Wait for it to complete
+sleep 2
 ```
+
+Type each of these in the GraphiQL interface and substitute the env variables with their actual values that we've defined above.
 
 Point your browser to http://localhost:8081. This is the wallet that didn't create the
 application, so we have to request it from the creator chain. As the chain ID specify the
 one of the chain where it isn't registered yet:
 
-```json
+```gql,uri=http://localhost:8081
 mutation {
-    requestApplication(
-        chainId: "1db1936dad0717597a7743a8353c9c0191c14c3a129b258e9743aec2b4f05d03",
-        applicationId: "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65010000000000000001000000e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65030000000000000000000000"
-    )
+  requestApplication(
+    chainId: "$CHAIN_1",
+    applicationId: "$APP_ID"
+  )
 }
 ```
 
 Now in both http://localhost:8080 and http://localhost:8081, this should list the
 application and provide a link to its GraphQL API. Remember to use each wallet's chain ID:
 
-```json
-query { applications(
-    chainId:"1db1936dad0717597a7743a8353c9c0191c14c3a129b258e9743aec2b4f05d03"
-) { id link } }
+```gql,uri=http://localhost:8081
+query {
+  applications(
+    chainId: "$CHAIN_1"
+  ) {
+    id
+    link
+  }
+}
 ```
 
 Open both URLs under the entry `link`. Now you can use the application on each chain.
-E.g. in the 8081 tab subscribe to the other chain:
+For the 8081 tab, you can run `echo "http://localhost:8081/chains/$CHAIN_1/applications/$APP_ID"`
+to print the URL to navigate to, then subscribe to the other chain using the following query:
 
-```json
+```gql,uri=http://localhost:8081/chains/$CHAIN_1/applications/$APP_ID
 mutation {
-    subscribe(
-        chainId: "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65"
-    )
+  subscribe(
+    chainId: "$CHAIN_2"
+  )
 }
 ```
 
-Now make a post in the 8080 tab:
+Run `echo "http://localhost:8080/chains/$CHAIN_2/applications/$APP_ID"` to print the URL to navigate to, then make a post:
 
-```json
+```gql,uri=http://localhost:8080/chains/$CHAIN_2/applications/$APP_ID
 mutation {
-    post(
-        text: "Linera Social is the new Mastodon!"
-    )
+  post(
+    text: "Linera Social is the new Mastodon!"
+    imageUrl: "https://linera.org/img/logo.svg" # optional
+  )
 }
 ```
 
-Since 8081 is a subscriber. Let's see if it received any posts:
+Since 8081 is a subscriber. Let's see if it received any posts: # You can see the post on running the [web-frontend](./web-frontend/), or follow the steps below.
 
-```json
-query { receivedPostsKeys { timestamp author index } }
+```gql,uri=http://localhost:8081/chains/$CHAIN_1/applications/$APP_ID
+query { receivedPosts { keys { timestamp author index } } }
 ```
 
 This should now list one entry, with timestamp, author and an index. If we view that
-entry, we can see the posted text:
+entry, we can see the posted text as well as other values:
 
-```json
+```gql
 query {
-  receivedPosts(
-    key: {
-      timestamp: 1685626618522492,
-      author: "e476187f6ddfeb9d588c7b45d3df334d5501d6499b3f9ad5595cae86cce16a65",
-      index: 0
+  receivedPosts {
+    entry(key: { timestamp: 1705504131018960, author: "$CHAIN_2", index: 0 }) {
+      value {
+        key {
+          timestamp
+          author
+          index
+        }
+        text
+        imageUrl
+        comments {
+          text
+          chainId
+        }
+        likes
+      }
     }
-  )
+  }
 }
 ```
 
 ```json
 {
   "data": {
-    "receivedPosts": "Linera Social is the new Mastodon!"
+    "receivedPosts": {
+      "entry": {
+        "value": {
+          "key": {
+            "timestamp": 1705504131018960,
+            "author": "$CHAIN_2",
+            "index": 0
+          },
+          "text": "Linera Social is the new Mastodon!",
+          "imageUrl": "https://linera.org/img/logo.svg",
+          "comments": [],
+          "likes": 0
+        }
+      }
+    }
   }
 }
 ```
-
-<!-- cargo-rdme end -->

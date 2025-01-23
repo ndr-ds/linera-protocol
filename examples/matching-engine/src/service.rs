@@ -5,34 +5,45 @@
 
 mod state;
 
-use crate::state::{MatchingEngine, MatchingEngineError};
-use async_graphql::{EmptySubscription, Request, Response, Schema};
-use async_trait::async_trait;
-use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, QueryContext, Service, ViewStateStorage,
-};
-use matching_engine::Operation;
 use std::sync::Arc;
 
-linera_sdk::service!(MatchingEngine);
+use async_graphql::{EmptySubscription, Request, Response, Schema};
+use linera_sdk::{
+    base::WithServiceAbi, graphql::GraphQLMutationRoot, views::View, Service, ServiceRuntime,
+};
+use matching_engine::{Operation, Parameters};
 
-impl WithServiceAbi for MatchingEngine {
+use crate::state::MatchingEngineState;
+
+pub struct MatchingEngineService {
+    state: Arc<MatchingEngineState>,
+}
+
+linera_sdk::service!(MatchingEngineService);
+
+impl WithServiceAbi for MatchingEngineService {
     type Abi = matching_engine::MatchingEngineAbi;
 }
 
-#[async_trait]
-impl Service for MatchingEngine {
-    type Error = MatchingEngineError;
-    type Storage = ViewStateStorage<Self>;
+impl Service for MatchingEngineService {
+    type Parameters = Parameters;
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
-        let schema =
-            Schema::build(self.clone(), Operation::mutation_root(), EmptySubscription).finish();
-        let response = schema.execute(request).await;
-        Ok(response)
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        let state = MatchingEngineState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        MatchingEngineService {
+            state: Arc::new(state),
+        }
+    }
+
+    async fn handle_query(&self, request: Request) -> Response {
+        let schema = Schema::build(
+            self.state.clone(),
+            Operation::mutation_root(),
+            EmptySubscription,
+        )
+        .finish();
+        schema.execute(request).await
     }
 }

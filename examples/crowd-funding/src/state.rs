@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use async_graphql::scalar;
-use crowd_funding::InitializationArgument;
-use fungible::AccountOwner;
+use crowd_funding::InstantiationArgument;
 use linera_sdk::{
-    base::Amount,
-    views::{MapView, RegisterView, ViewStorageContext},
+    base::{AccountOwner, Amount},
+    views::{linera_views, MapView, RegisterView, RootView, ViewStorageContext},
 };
-use linera_views::views::{GraphQLView, RootView};
 use serde::{Deserialize, Serialize};
 
 /// The status of a crowd-funding campaign.
@@ -26,15 +24,15 @@ pub enum Status {
 scalar!(Status);
 
 /// The crowd-funding campaign's state.
-#[derive(RootView, GraphQLView)]
+#[derive(RootView, async_graphql::SimpleObject)]
 #[view(context = "ViewStorageContext")]
-pub struct CrowdFunding {
+pub struct CrowdFundingState {
     /// The status of the campaign.
     pub status: RegisterView<Status>,
     /// The map of pledges that will be collected if the campaign succeeds.
     pub pledges: MapView<AccountOwner, Amount>,
-    /// The initialization data that determine the details the campaign.
-    pub initialization_argument: RegisterView<Option<InitializationArgument>>,
+    /// The instantiation data that determine the details the campaign.
+    pub instantiation_argument: RegisterView<Option<InstantiationArgument>>,
 }
 
 #[allow(dead_code)]

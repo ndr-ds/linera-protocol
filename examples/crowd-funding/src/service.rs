@@ -5,44 +5,47 @@
 
 mod state;
 
-use async_graphql::{EmptySubscription, Request, Response, Schema};
-use async_trait::async_trait;
-use crowd_funding::Operation;
-
-use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, QueryContext, Service, ViewStateStorage,
-};
-use state::CrowdFunding;
 use std::sync::Arc;
-use thiserror::Error;
 
-linera_sdk::service!(CrowdFunding);
+use async_graphql::{EmptySubscription, Request, Response, Schema};
+use crowd_funding::Operation;
+use linera_sdk::{
+    base::{ApplicationId, WithServiceAbi},
+    graphql::GraphQLMutationRoot,
+    views::View,
+    Service, ServiceRuntime,
+};
+use state::CrowdFundingState;
 
-impl WithServiceAbi for CrowdFunding {
+pub struct CrowdFundingService {
+    state: Arc<CrowdFundingState>,
+}
+
+linera_sdk::service!(CrowdFundingService);
+
+impl WithServiceAbi for CrowdFundingService {
     type Abi = crowd_funding::CrowdFundingAbi;
 }
 
-#[async_trait]
-impl Service for CrowdFunding {
-    type Error = Error;
-    type Storage = ViewStateStorage<Self>;
+impl Service for CrowdFundingService {
+    type Parameters = ApplicationId<fungible::FungibleTokenAbi>;
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
-        let schema =
-            Schema::build(self.clone(), Operation::mutation_root(), EmptySubscription).finish();
-        let response = schema.execute(request).await;
-        Ok(response)
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        let state = CrowdFundingState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        CrowdFundingService {
+            state: Arc::new(state),
+        }
     }
-}
 
-/// An error that can occur during the service execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Invalid query argument in crowd-funding app: could not deserialize GraphQL request.
-    #[error("Invalid query argument in crowd-funding app: could not deserialize GraphQL request.")]
-    InvalidQuery(#[from] serde_json::Error),
+    async fn handle_query(&self, request: Request) -> Response {
+        let schema = Schema::build(
+            self.state.clone(),
+            Operation::mutation_root(),
+            EmptySubscription,
+        )
+        .finish();
+        schema.execute(request).await
+    }
 }

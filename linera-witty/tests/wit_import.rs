@@ -7,14 +7,26 @@
 
 #[path = "common/test_instance.rs"]
 mod test_instance;
+#[path = "common/wit_interface_test.rs"]
+mod wit_interface_test;
 
-#[cfg(feature = "wasmer")]
-use self::test_instance::WasmerInstanceFactory;
-#[cfg(feature = "wasmtime")]
-use self::test_instance::WasmtimeInstanceFactory;
-use self::test_instance::{MockInstanceFactory, TestInstanceFactory, WithoutExports};
-use linera_witty::{wit_import, Instance, Runtime, RuntimeMemory};
+use std::marker::PhantomData;
+
+use insta::assert_snapshot;
+use linera_witty::{
+    wit_generation::{WitInterface, WitInterfaceWriter, WitWorldWriter},
+    wit_import, Instance, MockInstance, Runtime, RuntimeMemory,
+};
 use test_case::test_case;
+
+#[cfg(with_wasmer)]
+use self::test_instance::WasmerInstanceFactory;
+#[cfg(with_wasmtime)]
+use self::test_instance::WasmtimeInstanceFactory;
+use self::{
+    test_instance::{MockInstanceFactory, TestInstanceFactory, WithoutExports},
+    wit_interface_test::{GETTERS, OPERATIONS, SETTERS, SIMPLE_FUNCTION},
+};
 
 /// An interface to import a single function without parameters or return values.
 #[wit_import(package = "witty-macros:test-modules")]
@@ -23,9 +35,9 @@ trait SimpleFunction {
 }
 
 /// Test importing a simple function without parameters or return values.
-#[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[test_case(MockInstanceFactory::<()>::default(); "with a mock instance")]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_simple_function<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -58,9 +70,9 @@ trait Getters {
 }
 
 /// Test importing functions with return values.
-#[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[test_case(MockInstanceFactory::<()>::default(); "with a mock instance")]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_getters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -163,9 +175,9 @@ trait Setters {
 }
 
 /// Test importing functions with parameters.
-#[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[test_case(MockInstanceFactory::<()>::default(); "with a mock instance")]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_setters<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -229,9 +241,9 @@ trait Operations {
 }
 
 /// Test importing functions with multiple parameters and return values.
-#[test_case(MockInstanceFactory::default(); "with a mock instance")]
-#[cfg_attr(feature = "wasmer", test_case(WasmerInstanceFactory; "with Wasmer"))]
-#[cfg_attr(feature = "wasmtime", test_case(WasmtimeInstanceFactory; "with Wasmtime"))]
+#[test_case(MockInstanceFactory::<()>::default(); "with a mock instance")]
+#[cfg_attr(with_wasmer, test_case(WasmerInstanceFactory::<()>::default(); "with Wasmer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmtimeInstanceFactory::<()>::default(); "with Wasmtime"))]
 fn test_operations<InstanceFactory>(mut factory: InstanceFactory)
 where
     InstanceFactory: TestInstanceFactory,
@@ -314,5 +326,52 @@ where
             .add_float64(128.0, 0.25)
             .expect("Failed to run guest's `add-f64` function"),
         128.25
+    );
+}
+
+/// Tests the generated [`WitInterface`] implementations for the types used in this test.
+#[test_case(PhantomData::<SimpleFunction<MockInstance<()>>>, SIMPLE_FUNCTION; "of_simple_function")]
+#[test_case(PhantomData::<Getters<MockInstance<()>>>, GETTERS; "of_getters")]
+#[test_case(PhantomData::<Setters<MockInstance<()>>>, SETTERS; "of_setters")]
+#[test_case(PhantomData::<Operations<MockInstance<()>>>, OPERATIONS; "of_operations")]
+fn test_wit_interface<Interface>(
+    _: PhantomData<Interface>,
+    expected_snippets: (&str, &[&str], &[(&str, &str)]),
+) where
+    Interface: WitInterface,
+{
+    wit_interface_test::test_wit_interface::<Interface>(expected_snippets);
+}
+
+/// Tests the generated file contents for the [`WitInterface`] implementations for the types used
+/// in this test.
+#[test_case(PhantomData::<SimpleFunction<MockInstance<()>>>, "simple-function"; "of_simple_function")]
+#[test_case(PhantomData::<Getters<MockInstance<()>>>, "getters"; "of_getters")]
+#[test_case(PhantomData::<Setters<MockInstance<()>>>, "setters"; "of_setters")]
+#[test_case(PhantomData::<Operations<MockInstance<()>>>, "operations"; "of_operations")]
+fn test_wit_interface_file<Interface>(_: PhantomData<Interface>, name: &str)
+where
+    Interface: WitInterface,
+{
+    assert_snapshot!(
+        name,
+        WitInterfaceWriter::new::<Interface>()
+            .generate_file_contents()
+            .collect::<String>()
+    );
+}
+
+/// Tests the generated file contents for a WIT world containing all the interfaces used in this
+/// test.
+#[test]
+fn test_wit_world_file() {
+    assert_snapshot!(
+        WitWorldWriter::new("witty-macros:test-modules", "test-world")
+            .export::<SimpleFunction<MockInstance<()>>>()
+            .export::<Getters<MockInstance<()>>>()
+            .export::<Setters<MockInstance<()>>>()
+            .export::<Operations<MockInstance<()>>>()
+            .generate_file_contents()
+            .collect::<String>()
     );
 }

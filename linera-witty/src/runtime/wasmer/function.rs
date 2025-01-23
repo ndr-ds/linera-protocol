@@ -3,6 +3,9 @@
 
 //! Implementations of [`InstanceWithFunction`] for Wasmer instances.
 
+use frunk::{hlist_pat, HList};
+use wasmer::{AsStoreRef, Extern, FromToNativeWasmType, NativeWasmTypeInto, TypedFunction};
+
 use super::{
     parameters::WasmerParameters, results::WasmerResults, EntrypointInstance, ReentrantInstance,
 };
@@ -10,15 +13,13 @@ use crate::{
     memory_layout::FlatLayout, primitive_types::FlatType, InstanceWithFunction, Runtime,
     RuntimeError,
 };
-use frunk::{hlist_pat, HList};
-use wasmer::{AsStoreRef, Extern, FromToNativeWasmType, TypedFunction};
 
 /// Implements [`InstanceWithFunction`] for functions with the provided amount of parameters for
 /// the [`EntrypointInstance`] and [`ReentrantInstance`] types.
 macro_rules! impl_instance_with_function {
     ($( $names:ident : $types:ident ),*) => {
-        impl_instance_with_function_for!(EntrypointInstance, $( $names: $types ),*);
-        impl_instance_with_function_for!(ReentrantInstance<'_>, $( $names: $types ),*);
+        impl_instance_with_function_for!(EntrypointInstance<UserData>, $( $names: $types ),*);
+        impl_instance_with_function_for!(ReentrantInstance<'_, UserData>, $( $names: $types ),*);
     };
 }
 
@@ -26,11 +27,12 @@ macro_rules! impl_instance_with_function {
 /// the provided `instance` type.
 macro_rules! impl_instance_with_function_for {
     ($instance:ty, $( $names:ident : $types:ident ),*) => {
-        impl<$( $types, )* Results> InstanceWithFunction<HList![$( $types ),*], Results>
+        impl<$( $types, )* Results, UserData> InstanceWithFunction<HList![$( $types ),*], Results>
             for $instance
         where
-            $( $types: FlatType + FromToNativeWasmType, )*
+            $( $types: FlatType + FromToNativeWasmType + NativeWasmTypeInto, )*
             Results: FlatLayout + WasmerResults,
+            UserData: 'static,
         {
             type Function = TypedFunction<
                 <HList![$( $types ),*] as WasmerParameters>::ImportParameters,
@@ -76,5 +78,6 @@ repeat_macro!(impl_instance_with_function =>
     m: M,
     n: N,
     o: O,
-    p: P
+    p: P,
+    q: Q
 );

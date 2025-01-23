@@ -5,45 +5,62 @@
 
 mod state;
 
-use self::state::FungibleToken;
-use async_graphql::{EmptySubscription, Request, Response, Schema};
-use async_trait::async_trait;
-use fungible::Operation;
+use std::sync::{Arc, Mutex};
+
+use async_graphql::{EmptySubscription, Object, Request, Response, Schema};
+use fungible::{Operation, Parameters};
 use linera_sdk::{
-    base::WithServiceAbi, graphql::GraphQLMutationRoot, QueryContext, Service, ViewStateStorage,
+    base::{AccountOwner, Amount, WithServiceAbi},
+    graphql::GraphQLMutationRoot,
+    views::{MapView, View},
+    Service, ServiceRuntime,
 };
-use std::sync::Arc;
-use thiserror::Error;
 
-linera_sdk::service!(FungibleToken);
+use self::state::FungibleTokenState;
 
-impl WithServiceAbi for FungibleToken {
+#[derive(Clone)]
+pub struct FungibleTokenService {
+    state: Arc<FungibleTokenState>,
+    runtime: Arc<Mutex<ServiceRuntime<Self>>>,
+}
+
+linera_sdk::service!(FungibleTokenService);
+
+impl WithServiceAbi for FungibleTokenService {
     type Abi = fungible::FungibleTokenAbi;
 }
 
-#[async_trait]
-impl Service for FungibleToken {
-    type Error = Error;
-    type Storage = ViewStateStorage<Self>;
+impl Service for FungibleTokenService {
+    type Parameters = Parameters;
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        let state = FungibleTokenState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        FungibleTokenService {
+            state: Arc::new(state),
+            runtime: Arc::new(Mutex::new(runtime)),
+        }
+    }
+
+    async fn handle_query(&self, request: Request) -> Response {
         let schema =
             Schema::build(self.clone(), Operation::mutation_root(), EmptySubscription).finish();
-        let response = schema.execute(request).await;
-        Ok(response)
+        schema.execute(request).await
     }
 }
 
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Invalid query argument; could not deserialize GraphQL request.
-    #[error(
-        "Invalid query argument; Fungible application only supports JSON encoded GraphQL queries"
-    )]
-    InvalidQuery(#[from] serde_json::Error),
+#[Object]
+impl FungibleTokenService {
+    async fn accounts(&self) -> &MapView<AccountOwner, Amount> {
+        &self.state.accounts
+    }
+
+    async fn ticker_symbol(&self) -> Result<String, async_graphql::Error> {
+        let runtime = self
+            .runtime
+            .try_lock()
+            .expect("Services only run in a single-thread");
+        Ok(runtime.application_parameters().ticker_symbol)
+    }
 }

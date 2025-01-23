@@ -1,33 +1,48 @@
 [package]
 name = "linera-chain"
-version = "0.4.0"
 description = "Persistent data and the corresponding logics used by the Linera protocol for chains of blocks, certificates, and cross-chain messaging."
-authors = ["Linera <contact@linera.io>"]
 readme = "README.md"
-repository = "https://github.com/linera-io/linera-protocol"
-homepage = "https://linera.dev"
 documentation = "https://docs.rs/linera-chain/latest/linera_chain/"
-license = "Apache-2.0"
-edition = "2021"
+
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [features]
-test = ["tokio/macros", "async-lock", "linera-base/test", "linera-execution/test"]
+test = ["tokio/macros", "linera-base/test", "linera-execution/test"]
+metrics = ["prometheus", "linera-views/metrics", "linera-execution/metrics"]
+web = ["linera-base/web", "linera-views/web", "linera-execution/web"]
+benchmark = ["linera-base/test"]
 
 [dependencies]
-async-trait = { workspace = true }
-async-lock = { version = "2.6.0", optional = true }
-async-graphql = { workspace = true }
-linera-base = { workspace = true }
-linera-execution = { workspace = true }
-linera-views = { workspace = true, features = ["metrics"] }
-futures = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+async-graphql.workspace = true
+async-trait.workspace = true
+custom_debug_derive.workspace = true
+futures.workspace = true
+hex.workspace = true
+linera-base.workspace = true
+linera-execution.workspace = true
+linera-views.workspace = true
+prometheus = { workspace = true, optional = true }
+rand_chacha.workspace = true
+rand_distr = { workspace = true, features = ["alloc", "serde1"] }
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-linera-chain = { path = ".", features = ["test"] }
+anyhow.workspace = true
+assert_matches.workspace = true
+bcs.workspace = true
+linera-chain = { path = ".", default-features = false, features = ["test"] }
+
+[build-dependencies]
+cfg_aliases.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["async-trait"]
+ignored = ["async-trait", "serde_bytes"]

@@ -1,0 +1,5 @@
+package linera:app;
+
+interface service-entrypoints {
+    handle-query: func(argument: list<u8>) -> list<u8>;
+}

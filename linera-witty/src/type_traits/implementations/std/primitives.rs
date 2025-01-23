@@ -3,16 +3,29 @@
 
 //! Implementations of the custom traits for other standard primitive types.
 
+use std::borrow::Cow;
+
+use frunk::{hlist, hlist_pat, HList};
+
 use crate::{
     GuestPointer, InstanceWithMemory, Layout, Memory, Runtime, RuntimeError, RuntimeMemory,
     WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, hlist_pat, HList};
 
 impl WitType for bool {
     const SIZE: u32 = 1;
 
     type Layout = HList![i8];
+    type Dependencies = HList![];
+
+    fn wit_type_name() -> Cow<'static, str> {
+        "bool".into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        // Primitive types don't need to be declared
+        "".into()
+    }
 }
 
 impl WitLoad for bool {
@@ -67,16 +80,25 @@ impl WitStore for bool {
 
 impl<'t, T> WitType for &'t T
 where
-    T: WitType,
+    T: WitType + ?Sized,
 {
     const SIZE: u32 = T::SIZE;
 
     type Layout = T::Layout;
+    type Dependencies = T::Dependencies;
+
+    fn wit_type_name() -> Cow<'static, str> {
+        T::wit_type_name()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        T::wit_type_declaration()
+    }
 }
 
 impl<'t, T> WitStore for &'t T
 where
-    T: WitStore,
+    T: WitStore + ?Sized,
 {
     fn store<Instance>(
         &self,

@@ -1,121 +1,85 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    runtime::{ApplicationStatus, ExecutionRuntime, SessionManager},
-    system::SystemExecutionStateView,
-    ContractRuntime, ExecutionError, ExecutionResult, ExecutionRuntimeContext, Message,
-    MessageContext, Operation, OperationContext, Query, QueryContext, RawExecutionResult,
-    RawOutgoingMessage, Response, SystemMessage, UserApplicationDescription, UserApplicationId,
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    mem, vec,
 };
+
+use futures::{stream::FuturesOrdered, FutureExt, StreamExt, TryStreamExt};
 use linera_base::{
-    ensure,
-    identifiers::{ChainId, Owner},
+    data_types::{Amount, BlockHeight, Timestamp},
+    identifiers::{Account, AccountOwner, ChainId, Destination, Owner},
 };
 use linera_views::{
-    common::Context,
+    context::Context,
     key_value_store_view::KeyValueStoreView,
-    reentrant_collection_view::ReentrantCollectionView,
-    register_view::RegisterView,
-    views::{View, ViewError},
+    reentrant_collection_view::HashedReentrantCollectionView,
+    views::{ClonableView, View},
 };
 use linera_views_derive::CryptoHashView;
-
-#[cfg(any(test, feature = "test"))]
+#[cfg(with_testing)]
 use {
-    crate::{system::SystemExecutionState, TestExecutionRuntimeContext, UserApplicationCode},
-    async_lock::Mutex,
-    linera_views::memory::{MemoryContext, TEST_MEMORY_MAX_STREAM_QUERIES},
-    std::collections::BTreeMap,
+    crate::{
+        ResourceControlPolicy, ResourceTracker, TestExecutionRuntimeContext, UserContractCode,
+    },
+    linera_base::data_types::Blob,
+    linera_views::context::MemoryContext,
     std::sync::Arc,
 };
 
+use super::{runtime::ServiceRuntimeRequest, ExecutionRequest};
+use crate::{
+    resources::ResourceController, system::SystemExecutionStateView, ContractSyncRuntime,
+    ExecutionError, ExecutionOutcome, ExecutionRuntimeConfig, ExecutionRuntimeContext, Message,
+    MessageContext, MessageKind, Operation, OperationContext, Query, QueryContext,
+    RawExecutionOutcome, RawOutgoingMessage, Response, ServiceSyncRuntime, SystemMessage,
+    TransactionTracker, UserApplicationDescription, UserApplicationId,
+};
+
 /// A view accessing the execution state of a chain.
-#[derive(Debug, CryptoHashView)]
+#[derive(Debug, ClonableView, CryptoHashView)]
 pub struct ExecutionStateView<C> {
     /// System application.
     pub system: SystemExecutionStateView<C>,
-    /// User applications (Simple based).
-    pub simple_users: ReentrantCollectionView<C, UserApplicationId, RegisterView<C, Vec<u8>>>,
-    /// User applications (View based).
-    pub view_users: ReentrantCollectionView<C, UserApplicationId, KeyValueStoreView<C>>,
+    /// User applications.
+    pub users: HashedReentrantCollectionView<C, UserApplicationId, KeyValueStoreView<C>>,
 }
 
-#[cfg(any(test, feature = "test"))]
+/// How to interact with a long-lived service runtime.
+pub struct ServiceRuntimeEndpoint {
+    /// How to receive requests.
+    pub incoming_execution_requests: futures::channel::mpsc::UnboundedReceiver<ExecutionRequest>,
+    /// How to query the runtime.
+    pub runtime_request_sender: std::sync::mpsc::Sender<ServiceRuntimeRequest>,
+}
+
+#[cfg(with_testing)]
 impl ExecutionStateView<MemoryContext<TestExecutionRuntimeContext>>
 where
     MemoryContext<TestExecutionRuntimeContext>: Context + Clone + Send + Sync + 'static,
-    ViewError:
-        From<<MemoryContext<TestExecutionRuntimeContext> as linera_views::common::Context>::Error>,
 {
-    /// Creates an in-memory view where the system state is set. This is used notably to
-    /// generate state hashes in tests.
-    pub async fn from_system_state(state: SystemExecutionState) -> Self {
-        // Destructure, to make sure we don't miss any fields.
-        let SystemExecutionState {
-            description,
-            epoch,
-            admin_id,
-            subscriptions,
-            committees,
-            ownership,
-            balance,
-            balances,
-            timestamp,
-            registry,
-        } = state;
-        let guard = Arc::new(Mutex::new(BTreeMap::new())).lock_arc().await;
-        let extra = TestExecutionRuntimeContext::new(
-            description.expect("Chain description should be set").into(),
-        );
-        let context = MemoryContext::new(guard, TEST_MEMORY_MAX_STREAM_QUERIES, extra);
-        let mut view = Self::load(context)
-            .await
-            .expect("Loading from memory should work");
-        view.system.description.set(description);
-        view.system.epoch.set(epoch);
-        view.system.admin_id.set(admin_id);
-        for subscription in subscriptions {
-            view.system
-                .subscriptions
-                .insert(&subscription)
-                .expect("serialization of subscription should not fail");
-        }
-        view.system.committees.set(committees);
-        view.system.ownership.set(ownership);
-        view.system.balance.set(balance);
-        for (owner, balance) in balances {
-            view.system
-                .balances
-                .insert(&owner, balance)
-                .expect("insertion of balances should not fail");
-        }
-        view.system.timestamp.set(timestamp);
-        view.system
-            .registry
-            .import(registry)
-            .expect("serialization of registry components should not fail");
-        view
-    }
-
-    /// Simulates the initialization of an application.
-    #[cfg(any(test, feature = "test"))]
-    pub async fn simulate_initialization(
+    /// Simulates the instantiation of an application.
+    pub async fn simulate_instantiation(
         &mut self,
-        application: UserApplicationCode,
+        contract: UserContractCode,
+        local_time: Timestamp,
         application_description: UserApplicationDescription,
-        initialization_argument: Vec<u8>,
+        instantiation_argument: Vec<u8>,
+        contract_blob: Blob,
+        service_blob: Blob,
     ) -> Result<(), ExecutionError> {
         let chain_id = application_description.creation.chain_id;
         let context = OperationContext {
             chain_id,
             authenticated_signer: None,
+            authenticated_caller_id: None,
             height: application_description.creation.height,
-            index: application_description.creation.index,
-            next_message_index: 0,
+            index: Some(0),
         };
 
-        let action = UserAction::Initialize(&context, initialization_argument);
+        let action = UserAction::Instantiate(context, instantiation_argument);
+        let next_message_index = application_description.creation.index + 1;
 
         let application_id = self
             .system
@@ -123,31 +87,65 @@ where
             .register_application(application_description)
             .await?;
 
+        self.system.used_blobs.insert(&contract_blob.id())?;
+        self.system.used_blobs.insert(&service_blob.id())?;
+
         self.context()
             .extra()
-            .user_applications()
-            .insert(application_id, application);
+            .user_contracts()
+            .insert(application_id, contract);
 
-        self.run_user_action(application_id, chain_id, action, &mut 10_000_000)
+        self.context()
+            .extra()
+            .add_blobs([contract_blob, service_blob])
             .await?;
 
+        let tracker = ResourceTracker::default();
+        let policy = ResourceControlPolicy::default();
+        let mut resource_controller = ResourceController {
+            policy: Arc::new(policy),
+            tracker,
+            account: None,
+        };
+        let mut txn_tracker = TransactionTracker::new(next_message_index, None);
+        self.run_user_action(
+            application_id,
+            chain_id,
+            local_time,
+            action,
+            context.refund_grant_to(),
+            None,
+            &mut txn_tracker,
+            &mut resource_controller,
+        )
+        .await?;
+        self.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
+            .await?;
         Ok(())
     }
 }
 
-enum UserAction<'a> {
-    Initialize(&'a OperationContext, Vec<u8>),
-    Operation(&'a OperationContext, &'a [u8]),
-    Message(&'a MessageContext, &'a [u8]),
+pub enum UserAction {
+    Instantiate(OperationContext, Vec<u8>),
+    Operation(OperationContext, Vec<u8>),
+    Message(MessageContext, Vec<u8>),
 }
 
-impl<'a> UserAction<'a> {
-    fn signer(&self) -> Option<Owner> {
+impl UserAction {
+    pub(crate) fn signer(&self) -> Option<Owner> {
         use UserAction::*;
         match self {
-            Initialize(context, _) => context.authenticated_signer,
+            Instantiate(context, _) => context.authenticated_signer,
             Operation(context, _) => context.authenticated_signer,
             Message(context, _) => context.authenticated_signer,
+        }
+    }
+
+    pub(crate) fn height(&self) -> BlockHeight {
+        match self {
+            UserAction::Instantiate(context, _) => context.height,
+            UserAction::Operation(context, _) => context.height,
+            UserAction::Message(context, _) => context.height,
         }
     }
 }
@@ -155,221 +153,424 @@ impl<'a> UserAction<'a> {
 impl<C> ExecutionStateView<C>
 where
     C: Context + Clone + Send + Sync + 'static,
-    ViewError: From<C::Error>,
     C::Extra: ExecutionRuntimeContext,
 {
+    #[expect(clippy::too_many_arguments)]
     async fn run_user_action(
         &mut self,
         application_id: UserApplicationId,
         chain_id: ChainId,
-        action: UserAction<'_>,
-        remaining_fuel: &mut u64,
-    ) -> Result<Vec<ExecutionResult>, ExecutionError> {
-        // Try to load the application. This may fail if the corresponding
-        // bytecode-publishing certificate doesn't exist yet on this validator.
-        let description = self
-            .system
-            .registry
-            .describe_application(application_id)
-            .await?;
-        let application = self
-            .context()
-            .extra()
-            .get_user_application(&description)
-            .await?;
-        let signer = action.signer();
-        // Create the execution runtime for this transaction.
-        let mut session_manager = SessionManager::default();
-        let mut results = Vec::new();
-        let mut applications = vec![ApplicationStatus {
-            id: application_id,
-            parameters: description.parameters,
-            signer,
-        }];
-        let runtime = ExecutionRuntime::new(
+        local_time: Timestamp,
+        action: UserAction,
+        refund_grant_to: Option<Account>,
+        grant: Option<&mut Amount>,
+        txn_tracker: &mut TransactionTracker,
+        resource_controller: &mut ResourceController<Option<Owner>>,
+    ) -> Result<(), ExecutionError> {
+        let ExecutionRuntimeConfig {} = self.context().extra().execution_runtime_config();
+        self.run_user_action_with_runtime(
+            application_id,
             chain_id,
-            &mut applications,
-            self,
-            &mut session_manager,
-            &mut results,
-            *remaining_fuel,
-        );
-        // Make the call to user code.
-        let call_result = match action {
-            UserAction::Initialize(context, argument) => {
-                application.initialize(context, &runtime, &argument).await
-            }
-            UserAction::Operation(context, operation) => {
-                application
-                    .execute_operation(context, &runtime, operation)
-                    .await
-            }
-            UserAction::Message(context, message) => {
-                application
-                    .execute_message(context, &runtime, message)
-                    .await
-            }
-        };
-        if let Err(ExecutionError::UserError(message)) = &call_result {
-            tracing::error!("User application reported an error: {message}");
-        }
-        let mut result = call_result?;
-        // Set the authenticated signer to be used in outgoing messages.
-        result.authenticated_signer = signer;
-        *remaining_fuel = runtime.remaining_fuel();
+            local_time,
+            action,
+            refund_grant_to,
+            grant,
+            txn_tracker,
+            resource_controller,
+        )
+        .await?;
+        Ok(())
+    }
 
-        // Check that applications were correctly stacked and unstacked.
-        assert_eq!(applications.len(), 1);
-        assert_eq!(applications[0].id, application_id);
-        // Make sure to declare the application first for all recipients of the user
-        // execution result.
-        let mut system_result = RawExecutionResult::default();
-        let applications = self
-            .system
-            .registry
-            .describe_applications_with_dependencies(vec![application_id], &Default::default())
+    #[expect(clippy::too_many_arguments)]
+    async fn run_user_action_with_runtime(
+        &mut self,
+        application_id: UserApplicationId,
+        chain_id: ChainId,
+        local_time: Timestamp,
+        action: UserAction,
+        refund_grant_to: Option<Account>,
+        grant: Option<&mut Amount>,
+        txn_tracker: &mut TransactionTracker,
+        resource_controller: &mut ResourceController<Option<Owner>>,
+    ) -> Result<(), ExecutionError> {
+        let mut cloned_grant = grant.as_ref().map(|x| **x);
+        let initial_balance = resource_controller
+            .with_state_and_grant(self, cloned_grant.as_mut())
+            .await?
+            .balance()?;
+        let controller = ResourceController {
+            policy: resource_controller.policy.clone(),
+            tracker: resource_controller.tracker,
+            account: initial_balance,
+        };
+        let (execution_state_sender, mut execution_state_receiver) =
+            futures::channel::mpsc::unbounded();
+        let txn_tracker_moved = mem::take(txn_tracker);
+        let (code, description) = self.load_contract(application_id).await?;
+        let contract_runtime_task = linera_base::task::Blocking::spawn(move |mut codes| {
+            let runtime = ContractSyncRuntime::new(
+                execution_state_sender,
+                chain_id,
+                local_time,
+                refund_grant_to,
+                controller,
+                &action,
+                txn_tracker_moved,
+            );
+
+            async move {
+                let code = codes.next().await.expect("we send this immediately below");
+                runtime.preload_contract(application_id, code, description)?;
+                runtime.run_action(application_id, chain_id, action)
+            }
+        })
+        .await;
+
+        contract_runtime_task.send(code)?;
+
+        while let Some(request) = execution_state_receiver.next().await {
+            self.handle_request(request).await?;
+        }
+
+        let (controller, txn_tracker_moved) = contract_runtime_task.join().await?;
+        *txn_tracker = txn_tracker_moved;
+        resource_controller
+            .with_state_and_grant(self, grant)
+            .await?
+            .merge_balance(initial_balance, controller.balance()?)?;
+        resource_controller.tracker = controller.tracker;
+        Ok(())
+    }
+
+    /// Schedules application registration messages when needed.
+    ///
+    /// Ensures that the outgoing messages in `results` are preceded by a system message that
+    /// registers the application that will handle the messages.
+    pub async fn update_execution_outcomes_with_app_registrations(
+        &self,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), ExecutionError> {
+        let results = txn_tracker.outcomes_mut();
+        let user_application_outcomes = results.iter().filter_map(|outcome| match outcome {
+            ExecutionOutcome::User(application_id, result) => Some((application_id, result)),
+            _ => None,
+        });
+
+        let mut applications_to_register_per_destination = BTreeMap::<_, BTreeSet<_>>::new();
+
+        for (application_id, result) in user_application_outcomes {
+            for message in &result.messages {
+                applications_to_register_per_destination
+                    .entry(&message.destination)
+                    .or_default()
+                    .insert(*application_id);
+            }
+        }
+
+        if applications_to_register_per_destination.is_empty() {
+            return Ok(());
+        }
+
+        let messages = applications_to_register_per_destination
+            .into_iter()
+            .map(|(destination, applications_to_describe)| async {
+                let applications = self
+                    .system
+                    .registry
+                    .describe_applications_with_dependencies(
+                        applications_to_describe.into_iter().collect(),
+                        &HashMap::new(),
+                    )
+                    .await?;
+
+                Ok::<_, ExecutionError>(RawOutgoingMessage {
+                    destination: destination.clone(),
+                    authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Simple,
+                    message: SystemMessage::RegisterApplications { applications },
+                })
+            })
+            .collect::<FuturesOrdered<_>>()
+            .try_collect::<Vec<_>>()
             .await?;
-        for message in &result.messages {
-            system_result.messages.push(RawOutgoingMessage {
-                destination: message.destination.clone(),
-                authenticated: false,
-                message: SystemMessage::RegisterApplications {
-                    applications: applications.clone(),
-                },
-            });
-        }
-        if !system_result.messages.is_empty() {
-            results.push(ExecutionResult::System(system_result));
-        }
-        // Update externally-visible results.
-        results.push(ExecutionResult::User(application_id, result));
-        // Check that all sessions were properly closed.
-        ensure!(
-            session_manager.states.is_empty(),
-            ExecutionError::SessionWasNotClosed
-        );
-        Ok(results)
+
+        let system_outcome = RawExecutionOutcome {
+            messages,
+            ..RawExecutionOutcome::default()
+        };
+
+        // Insert the message before the first user outcome.
+        let index = results
+            .iter()
+            .position(|outcome| matches!(outcome, ExecutionOutcome::User(_, _)))
+            .unwrap_or(results.len());
+        // TODO(#2362): This inserts messages in front of existing ones, invalidating their IDs.
+        results.insert(index, ExecutionOutcome::System(system_outcome));
+
+        Ok(())
     }
 
     pub async fn execute_operation(
         &mut self,
-        context: &OperationContext,
-        operation: &Operation,
-        remaining_fuel: &mut u64,
-    ) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        context: OperationContext,
+        local_time: Timestamp,
+        operation: Operation,
+        txn_tracker: &mut TransactionTracker,
+        resource_controller: &mut ResourceController<Option<Owner>>,
+    ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
         match operation {
             Operation::System(op) => {
-                let (mut result, new_application) =
-                    self.system.execute_operation(context, op).await?;
-                result.authenticated_signer = context.authenticated_signer;
-                let mut results = vec![ExecutionResult::System(result)];
+                let new_application = self
+                    .system
+                    .execute_operation(context, op, txn_tracker)
+                    .await?;
                 if let Some((application_id, argument)) = new_application {
-                    let user_action = UserAction::Initialize(context, argument);
-                    results.extend(
-                        self.run_user_action(
-                            application_id,
-                            context.chain_id,
-                            user_action,
-                            remaining_fuel,
-                        )
-                        .await?,
-                    );
+                    let user_action = UserAction::Instantiate(context, argument);
+                    self.run_user_action(
+                        application_id,
+                        context.chain_id,
+                        local_time,
+                        user_action,
+                        context.refund_grant_to(),
+                        None,
+                        txn_tracker,
+                        resource_controller,
+                    )
+                    .await?;
                 }
-                Ok(results)
             }
             Operation::User {
                 application_id,
                 bytes,
             } => {
                 self.run_user_action(
-                    *application_id,
+                    application_id,
                     context.chain_id,
+                    local_time,
                     UserAction::Operation(context, bytes),
-                    remaining_fuel,
+                    context.refund_grant_to(),
+                    None,
+                    txn_tracker,
+                    resource_controller,
                 )
-                .await
+                .await?;
             }
         }
+        Ok(())
     }
 
     pub async fn execute_message(
         &mut self,
-        context: &MessageContext,
-        message: &Message,
-        remaining_fuel: &mut u64,
-    ) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        context: MessageContext,
+        local_time: Timestamp,
+        message: Message,
+        grant: Option<&mut Amount>,
+        txn_tracker: &mut TransactionTracker,
+        resource_controller: &mut ResourceController<Option<Owner>>,
+    ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
         match message {
             Message::System(message) => {
-                let result = self.system.execute_message(context, message).await?;
-                Ok(vec![ExecutionResult::System(result)])
+                let outcome = self
+                    .system
+                    .execute_message(context, message, txn_tracker)
+                    .await?;
+                txn_tracker.add_system_outcome(outcome)?;
             }
             Message::User {
                 application_id,
                 bytes,
             } => {
                 self.run_user_action(
-                    *application_id,
+                    application_id,
                     context.chain_id,
+                    local_time,
                     UserAction::Message(context, bytes),
-                    remaining_fuel,
+                    context.refund_grant_to,
+                    grant,
+                    txn_tracker,
+                    resource_controller,
                 )
-                .await
+                .await?;
             }
         }
+        Ok(())
+    }
+
+    pub async fn bounce_message(
+        &self,
+        context: MessageContext,
+        grant: Amount,
+        message: Message,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), ExecutionError> {
+        assert_eq!(context.chain_id, self.context().extra().chain_id());
+        match message {
+            Message::System(message) => {
+                let mut outcome = RawExecutionOutcome {
+                    authenticated_signer: context.authenticated_signer,
+                    refund_grant_to: context.refund_grant_to,
+                    ..Default::default()
+                };
+                outcome.messages.push(RawOutgoingMessage {
+                    destination: Destination::Recipient(context.message_id.chain_id),
+                    authenticated: true,
+                    grant,
+                    kind: MessageKind::Bouncing,
+                    message,
+                });
+                txn_tracker.add_system_outcome(outcome)?;
+            }
+            Message::User {
+                application_id,
+                bytes,
+            } => {
+                let mut outcome = RawExecutionOutcome {
+                    authenticated_signer: context.authenticated_signer,
+                    refund_grant_to: context.refund_grant_to,
+                    ..Default::default()
+                };
+                outcome.messages.push(RawOutgoingMessage {
+                    destination: Destination::Recipient(context.message_id.chain_id),
+                    authenticated: true,
+                    grant,
+                    kind: MessageKind::Bouncing,
+                    message: bytes,
+                });
+                txn_tracker.add_user_outcome(application_id, outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn send_refund(
+        &self,
+        context: MessageContext,
+        amount: Amount,
+        account: Account,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), ExecutionError> {
+        assert_eq!(context.chain_id, self.context().extra().chain_id());
+        let mut outcome = RawExecutionOutcome::default();
+        let message = RawOutgoingMessage {
+            destination: Destination::Recipient(account.chain_id),
+            authenticated: false,
+            grant: Amount::ZERO,
+            kind: MessageKind::Tracked,
+            message: SystemMessage::Credit {
+                amount,
+                source: context.authenticated_signer.map(AccountOwner::User),
+                target: account.owner,
+            },
+        };
+        outcome.messages.push(message);
+        txn_tracker.add_system_outcome(outcome)?;
+        Ok(())
     }
 
     pub async fn query_application(
         &mut self,
-        context: &QueryContext,
-        query: &Query,
+        context: QueryContext,
+        query: Query,
+        endpoint: Option<&mut ServiceRuntimeEndpoint>,
     ) -> Result<Response, ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
         match query {
             Query::System(query) => {
-                let response = self.system.query_application(context, query).await?;
+                let response = self.system.handle_query(context, query).await?;
                 Ok(Response::System(response))
             }
             Query::User {
                 application_id,
                 bytes,
             } => {
-                // Load the application.
-                let description = self
-                    .system
-                    .registry
-                    .describe_application(*application_id)
-                    .await?;
-                let application = self
-                    .context()
-                    .extra()
-                    .get_user_application(&description)
-                    .await?;
-                // Create the execution runtime for this transaction.
-                let mut session_manager = SessionManager::default();
-                let mut results = Vec::new();
-                let mut applications = vec![ApplicationStatus {
-                    id: *application_id,
-                    parameters: description.parameters,
-                    signer: None,
-                }];
-                let runtime = ExecutionRuntime::new(
-                    context.chain_id,
-                    &mut applications,
-                    self,
-                    &mut session_manager,
-                    &mut results,
-                    0,
-                );
-                // Run the query.
-                let response = application
-                    .query_application(context, &runtime, bytes)
-                    .await?;
-                // Check that applications were correctly stacked and unstacked.
-                assert_eq!(applications.len(), 1);
-                assert_eq!(&applications[0].id, application_id);
+                let ExecutionRuntimeConfig {} = self.context().extra().execution_runtime_config();
+                let response = match endpoint {
+                    Some(endpoint) => {
+                        self.query_user_application_with_long_lived_service(
+                            application_id,
+                            context,
+                            bytes,
+                            &mut endpoint.incoming_execution_requests,
+                            &mut endpoint.runtime_request_sender,
+                        )
+                        .await?
+                    }
+                    None => {
+                        self.query_user_application(application_id, context, bytes)
+                            .await?
+                    }
+                };
                 Ok(Response::User(response))
+            }
+        }
+    }
+
+    async fn query_user_application(
+        &mut self,
+        application_id: UserApplicationId,
+        context: QueryContext,
+        query: Vec<u8>,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let (execution_state_sender, mut execution_state_receiver) =
+            futures::channel::mpsc::unbounded();
+        let (code, description) = self.load_service(application_id).await?;
+
+        let service_runtime_task = linera_base::task::Blocking::spawn(move |mut codes| {
+            let mut runtime = ServiceSyncRuntime::new(execution_state_sender, context);
+
+            async move {
+                let code = codes.next().await.expect("we send this immediately below");
+                runtime.preload_service(application_id, code, description)?;
+                runtime.run_query(application_id, query)
+            }
+        })
+        .await;
+
+        service_runtime_task.send(code)?;
+
+        while let Some(request) = execution_state_receiver.next().await {
+            self.handle_request(request).await?;
+        }
+
+        service_runtime_task.join().await
+    }
+
+    async fn query_user_application_with_long_lived_service(
+        &mut self,
+        application_id: UserApplicationId,
+        context: QueryContext,
+        query: Vec<u8>,
+        incoming_execution_requests: &mut futures::channel::mpsc::UnboundedReceiver<
+            ExecutionRequest,
+        >,
+        runtime_request_sender: &mut std::sync::mpsc::Sender<ServiceRuntimeRequest>,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        let mut response_receiver = response_receiver.fuse();
+
+        runtime_request_sender
+            .send(ServiceRuntimeRequest::Query {
+                application_id,
+                context,
+                query,
+                callback: response_sender,
+            })
+            .expect("Service runtime thread should only stop when `request_sender` is dropped");
+
+        loop {
+            futures::select! {
+                maybe_request = incoming_execution_requests.next() => {
+                    if let Some(request) = maybe_request {
+                        self.handle_request(request).await?;
+                    }
+                }
+                response = &mut response_receiver => {
+                    return response.map_err(|_| ExecutionError::MissingRuntimeResponse)?;
+                }
             }
         }
     }
