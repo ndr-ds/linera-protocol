@@ -3,17 +3,28 @@
 
 //! Implementations of the custom traits for types from the standard library.
 
+use std::{borrow::Cow, ops::Add};
+
+use frunk::{HCons, HList, HNil};
+
 use crate::{
     GuestPointer, InstanceWithMemory, Layout, Memory, Runtime, RuntimeError, RuntimeMemory, Split,
     WitLoad, WitStore, WitType,
 };
-use frunk::{HCons, HNil};
-use std::ops::Add;
 
 impl WitType for HNil {
     const SIZE: u32 = 0;
 
     type Layout = HNil;
+    type Dependencies = HNil;
+
+    fn wit_type_name() -> Cow<'static, str> {
+        "hnil".into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        "type hnil = unit".into()
+    }
 }
 
 impl WitLoad for HNil {
@@ -70,9 +81,26 @@ where
     Head::Layout: Add<Tail::Layout>,
     <Head::Layout as Add<Tail::Layout>>::Output: Layout,
 {
-    const SIZE: u32 = Self::SIZE_STARTING_AT_BYTE_BOUNDARIES[0];
+    const SIZE: u32 = {
+        let packed_size = Self::SIZE_STARTING_AT_BYTE_BOUNDARIES[0];
+        let aligned_size = GuestPointer(packed_size).after_padding_for::<Self>();
+
+        aligned_size.0
+    };
 
     type Layout = <Head::Layout as Add<Tail::Layout>>::Output;
+    type Dependencies = HList![Head, Tail];
+
+    fn wit_type_name() -> Cow<'static, str> {
+        format!("hcons-{}-{}", Head::wit_type_name(), Tail::wit_type_name()).into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        let head = Head::wit_type_name();
+        let tail = Tail::wit_type_name();
+
+        format!("type hcons-{head}-{tail} = tuple<{head}, {tail}>").into()
+    }
 }
 
 impl<Head, Tail> WitLoad for HCons<Head, Tail>

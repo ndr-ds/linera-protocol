@@ -5,220 +5,131 @@
 
 mod state;
 
-use self::state::Counter;
-use async_trait::async_trait;
+use counter::CounterAbi;
 use linera_sdk::{
-    base::{SessionId, WithContractAbi},
-    ApplicationCallResult, CalleeContext, Contract, ExecutionResult, MessageContext,
-    OperationContext, SessionCallResult, SimpleStateStorage,
+    base::WithContractAbi,
+    views::{RootView, View},
+    Contract, ContractRuntime,
 };
-use thiserror::Error;
 
-linera_sdk::contract!(Counter);
+use self::state::CounterState;
 
-impl WithContractAbi for Counter {
-    type Abi = counter::CounterAbi;
+pub struct CounterContract {
+    state: CounterState,
+    runtime: ContractRuntime<Self>,
 }
 
-#[async_trait]
-impl Contract for Counter {
-    type Error = Error;
-    type Storage = SimpleStateStorage<Self>;
+linera_sdk::contract!(CounterContract);
 
-    async fn initialize(
-        &mut self,
-        _context: &OperationContext,
-        value: u64,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        self.value = value;
-        Ok(ExecutionResult::default())
-    }
-
-    async fn execute_operation(
-        &mut self,
-        _context: &OperationContext,
-        operation: u64,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        self.value += operation;
-        Ok(ExecutionResult::default())
-    }
-
-    async fn execute_message(
-        &mut self,
-        _context: &MessageContext,
-        _message: (),
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        Err(Error::MessagesNotSupported)
-    }
-
-    async fn handle_application_call(
-        &mut self,
-        _context: &CalleeContext,
-        increment: u64,
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<ApplicationCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        self.value += increment;
-        Ok(ApplicationCallResult {
-            value: self.value,
-            ..ApplicationCallResult::default()
-        })
-    }
-
-    async fn handle_session_call(
-        &mut self,
-        _context: &CalleeContext,
-        _state: Self::SessionState,
-        _call: (),
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<SessionCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        Err(Error::SessionsNotSupported)
-    }
+impl WithContractAbi for CounterContract {
+    type Abi = CounterAbi;
 }
 
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Counter application doesn't support any cross-chain messages.
-    #[error("Counter application doesn't support any cross-chain messages")]
-    MessagesNotSupported,
+impl Contract for CounterContract {
+    type Message = ();
+    type InstantiationArgument = u64;
+    type Parameters = ();
 
-    /// Counter application doesn't support any cross-application sessions.
-    #[error("Counter application doesn't support any cross-application sessions")]
-    SessionsNotSupported,
+    async fn load(runtime: ContractRuntime<Self>) -> Self {
+        let state = CounterState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        CounterContract { state, runtime }
+    }
 
-    /// Failed to deserialize BCS bytes
-    #[error("Failed to deserialize BCS bytes")]
-    BcsError(#[from] bcs::Error),
+    async fn instantiate(&mut self, value: u64) {
+        // Validate that the application parameters were configured correctly.
+        self.runtime.application_parameters();
 
-    /// Failed to deserialize JSON string
-    #[error("Failed to deserialize JSON string")]
-    JsonError(#[from] serde_json::Error),
+        self.state.value.set(value);
+    }
+
+    async fn execute_operation(&mut self, operation: u64) -> u64 {
+        let new_value = self.state.value.get() + operation;
+        self.state.value.set(new_value);
+        new_value
+    }
+
+    async fn execute_message(&mut self, _message: ()) {
+        panic!("Counter application doesn't support any cross-chain messages");
+    }
+
+    async fn store(mut self) {
+        self.state.save().await.expect("Failed to save state");
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Counter, Error};
-    use futures::FutureExt;
-    use linera_sdk::{
-        base::{BlockHeight, ChainId, MessageId},
-        ApplicationCallResult, CalleeContext, Contract, ExecutionResult, MessageContext,
-        OperationContext,
-    };
-    use webassembly_test::webassembly_test;
+    use futures::FutureExt as _;
+    use linera_sdk::{util::BlockingWait, views::View, Contract, ContractRuntime};
 
-    #[webassembly_test]
+    use super::{CounterContract, CounterState};
+
+    #[test]
     fn operation() {
         let initial_value = 72_u64;
-        let mut counter = create_and_initialize_counter(initial_value);
+        let mut counter = create_and_instantiate_counter(initial_value);
 
         let increment = 42_308_u64;
 
-        let result = counter
-            .execute_operation(&dummy_operation_context(), increment)
-            .now_or_never()
-            .expect("Execution of counter operation should not await anything");
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), ExecutionResult::default());
-        assert_eq!(counter.value, initial_value + increment);
-    }
-
-    #[webassembly_test]
-    fn message() {
-        let initial_value = 72_u64;
-        let mut counter = create_and_initialize_counter(initial_value);
-
-        let result = counter
-            .execute_message(&dummy_message_context(), ())
-            .now_or_never()
-            .expect("Execution of counter operation should not await anything");
-
-        assert!(matches!(result, Err(Error::MessagesNotSupported)));
-        assert_eq!(counter.value, initial_value);
-    }
-
-    #[webassembly_test]
-    fn cross_application_call() {
-        let initial_value = 2_845_u64;
-        let mut counter = create_and_initialize_counter(initial_value);
-
-        let increment = 8_u64;
-
-        let result = counter
-            .handle_application_call(&dummy_callee_context(), increment, vec![])
+        let response = counter
+            .execute_operation(increment)
             .now_or_never()
             .expect("Execution of counter operation should not await anything");
 
         let expected_value = initial_value + increment;
-        let expected_result = ApplicationCallResult {
-            value: expected_value,
-            create_sessions: vec![],
-            execution_result: ExecutionResult::default(),
-        };
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_result);
-        assert_eq!(counter.value, expected_value);
+        assert_eq!(response, expected_value);
+        assert_eq!(*counter.state.value.get(), initial_value + increment);
     }
 
-    #[webassembly_test]
-    fn sessions() {
+    #[test]
+    #[should_panic(expected = "Counter application doesn't support any cross-chain messages")]
+    fn message() {
         let initial_value = 72_u64;
-        let mut counter = create_and_initialize_counter(initial_value);
+        let mut counter = create_and_instantiate_counter(initial_value);
 
-        let result = counter
-            .handle_session_call(&dummy_callee_context(), Default::default(), (), vec![])
+        counter
+            .execute_message(())
+            .now_or_never()
+            .expect("Execution of counter operation should not await anything");
+    }
+
+    #[test]
+    fn cross_application_call() {
+        let initial_value = 2_845_u64;
+        let mut counter = create_and_instantiate_counter(initial_value);
+
+        let increment = 8_u64;
+
+        let response = counter
+            .execute_operation(increment)
             .now_or_never()
             .expect("Execution of counter operation should not await anything");
 
-        assert!(matches!(result, Err(Error::SessionsNotSupported)));
-        assert_eq!(counter.value, initial_value);
+        let expected_value = initial_value + increment;
+
+        assert_eq!(response, expected_value);
+        assert_eq!(*counter.state.value.get(), expected_value);
     }
 
-    fn create_and_initialize_counter(initial_value: u64) -> Counter {
-        let mut counter = Counter::default();
+    fn create_and_instantiate_counter(initial_value: u64) -> CounterContract {
+        let runtime = ContractRuntime::new().with_application_parameters(());
+        let mut contract = CounterContract {
+            state: CounterState::load(runtime.root_view_storage_context())
+                .blocking_wait()
+                .expect("Failed to read from mock key value store"),
+            runtime,
+        };
 
-        let result = counter
-            .initialize(&dummy_operation_context(), initial_value)
+        contract
+            .instantiate(initial_value)
             .now_or_never()
             .expect("Initialization of counter state should not await anything");
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), ExecutionResult::default());
-        assert_eq!(counter.value, initial_value);
+        assert_eq!(*contract.state.value.get(), initial_value);
 
-        counter
-    }
-
-    fn dummy_operation_context() -> OperationContext {
-        OperationContext {
-            chain_id: ChainId([0; 4].into()),
-            authenticated_signer: None,
-            height: BlockHeight(0),
-            index: 0,
-        }
-    }
-
-    fn dummy_message_context() -> MessageContext {
-        MessageContext {
-            chain_id: ChainId([0; 4].into()),
-            authenticated_signer: None,
-            height: BlockHeight(0),
-            message_id: MessageId {
-                chain_id: ChainId([1; 4].into()),
-                height: BlockHeight(1),
-                index: 1,
-            },
-        }
-    }
-
-    fn dummy_callee_context() -> CalleeContext {
-        CalleeContext {
-            chain_id: ChainId([0; 4].into()),
-            authenticated_signer: None,
-            authenticated_caller_id: None,
-        }
+        contract
     }
 }

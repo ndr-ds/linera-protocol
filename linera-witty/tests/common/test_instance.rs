@@ -3,23 +3,25 @@
 
 //! Helper code for testing using different runtimes.
 
-use frunk::{hlist, hlist_pat, HList};
-#[cfg(feature = "wasmer")]
-use linera_witty::wasmer;
-#[cfg(feature = "wasmtime")]
-use linera_witty::wasmtime;
-use linera_witty::{
-    ExportTo, InstanceWithMemory, Layout, MockExportedFunction, MockInstance, RuntimeError,
-    WitLoad, WitStore,
-};
 use std::{
     any::Any,
     fmt::Debug,
+    marker::PhantomData,
     ops::Add,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
+};
+
+use frunk::{hlist, hlist_pat, HList};
+#[cfg(with_wasmer)]
+use linera_witty::wasmer;
+#[cfg(with_wasmtime)]
+use linera_witty::wasmtime;
+use linera_witty::{
+    ExportTo, InstanceWithMemory, Layout, MockExportedFunction, MockInstance, RuntimeError,
+    WitLoad, WitStore,
 };
 
 /// Trait representing a type that can create instances for tests.
@@ -45,14 +47,18 @@ pub trait TestInstanceFactory {
 }
 
 /// A factory of [`wasmtime::Entrypoint`] instances.
-#[cfg(feature = "wasmtime")]
-pub struct WasmtimeInstanceFactory;
+#[cfg(with_wasmtime)]
+#[derive(Default)]
+pub struct WasmtimeInstanceFactory<UserData>(PhantomData<UserData>);
 
-#[cfg(feature = "wasmtime")]
-impl TestInstanceFactory for WasmtimeInstanceFactory {
-    type Builder = ::wasmtime::Linker<()>;
-    type Instance = wasmtime::EntrypointInstance;
-    type Caller<'caller> = ::wasmtime::Caller<'caller, ()>;
+#[cfg(with_wasmtime)]
+impl<UserData> TestInstanceFactory for WasmtimeInstanceFactory<UserData>
+where
+    UserData: Default + 'static,
+{
+    type Builder = ::wasmtime::Linker<UserData>;
+    type Instance = wasmtime::EntrypointInstance<UserData>;
+    type Caller<'caller> = ::wasmtime::Caller<'caller, UserData>;
 
     fn load_test_module<ExportedFunctions>(&mut self, group: &str, module: &str) -> Self::Instance
     where
@@ -70,7 +76,7 @@ impl TestInstanceFactory for WasmtimeInstanceFactory {
         ExportedFunctions::export_to(&mut linker)
             .expect("Failed to export functions to Wasmtime linker");
 
-        let mut store = ::wasmtime::Store::new(&engine, ());
+        let mut store = ::wasmtime::Store::new(&engine, UserData::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .expect("Failed to instantiate module");
@@ -80,27 +86,33 @@ impl TestInstanceFactory for WasmtimeInstanceFactory {
 }
 
 /// A factory of [`wasmer::EntrypointInstance`]s.
-#[cfg(feature = "wasmer")]
-pub struct WasmerInstanceFactory;
+#[cfg(with_wasmer)]
+#[derive(Default)]
+pub struct WasmerInstanceFactory<UserData>(PhantomData<UserData>);
 
-#[cfg(feature = "wasmer")]
-impl TestInstanceFactory for WasmerInstanceFactory {
-    type Builder = wasmer::InstanceBuilder;
-    type Instance = wasmer::EntrypointInstance;
-    type Caller<'caller> = ::wasmer::FunctionEnvMut<'caller, wasmer::InstanceSlot>;
+#[cfg(with_wasmer)]
+impl<UserData> TestInstanceFactory for WasmerInstanceFactory<UserData>
+where
+    UserData: Default + Send + 'static,
+{
+    type Builder = wasmer::InstanceBuilder<UserData>;
+    type Instance = wasmer::EntrypointInstance<UserData>;
+    type Caller<'caller> = ::wasmer::FunctionEnvMut<'caller, wasmer::Environment<UserData>>;
 
     fn load_test_module<ExportedFunctions>(&mut self, group: &str, module: &str) -> Self::Instance
     where
         ExportedFunctions: ExportTo<Self::Builder>,
     {
-        let engine = ::wasmer::EngineBuilder::new(::wasmer::Singlepass::default()).engine();
+        let engine = ::wasmer::sys::EngineBuilder::new(::wasmer::Singlepass::default())
+            .engine()
+            .into();
         let module = ::wasmer::Module::from_file(
             &engine,
             format!("../target/wasm32-unknown-unknown/debug/{group}-{module}.wasm"),
         )
         .expect("Failed to load module");
 
-        let mut builder = wasmer::InstanceBuilder::new(engine);
+        let mut builder = wasmer::InstanceBuilder::new(engine, UserData::default());
 
         ExportedFunctions::export_to(&mut builder)
             .expect("Failed to export functions to Wasmer instance builder");
@@ -113,14 +125,18 @@ impl TestInstanceFactory for WasmerInstanceFactory {
 
 /// A factory of [`MockInstance`]s.
 #[derive(Default)]
-pub struct MockInstanceFactory {
+pub struct MockInstanceFactory<UserData = ()> {
     deferred_assertions: Vec<Box<dyn Any>>,
+    user_data: PhantomData<UserData>,
 }
 
-impl TestInstanceFactory for MockInstanceFactory {
-    type Builder = MockInstance;
-    type Instance = MockInstance;
-    type Caller<'caller> = MockInstance;
+impl<UserData> TestInstanceFactory for MockInstanceFactory<UserData>
+where
+    UserData: Default + 'static,
+{
+    type Builder = MockInstance<UserData>;
+    type Instance = MockInstance<UserData>;
+    type Caller<'caller> = MockInstance<UserData>;
 
     fn load_test_module<ExportedFunctions>(&mut self, group: &str, module: &str) -> Self::Instance
     where
@@ -154,9 +170,12 @@ impl TestInstanceFactory for MockInstanceFactory {
     }
 }
 
-impl MockInstanceFactory {
+impl<UserData> MockInstanceFactory<UserData>
+where
+    UserData: 'static,
+{
     /// Mock the exported functions from the "export-simple-function" module.
-    fn export_simple_function(&mut self, instance: &mut MockInstance) {
+    fn export_simple_function(&mut self, instance: &mut MockInstance<UserData>) {
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/simple-function#simple",
@@ -166,7 +185,7 @@ impl MockInstanceFactory {
     }
 
     /// Mock the exported functions from the "export-getters" module.
-    fn export_getters(&mut self, instance: &mut MockInstance) {
+    fn export_getters(&mut self, instance: &mut MockInstance<UserData>) {
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/getters#get-true",
@@ -242,7 +261,7 @@ impl MockInstanceFactory {
     }
 
     /// Mock the exported functions from the "export-setters" module.
-    fn export_setters(&mut self, instance: &mut MockInstance) {
+    fn export_setters(&mut self, instance: &mut MockInstance<UserData>) {
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/setters#set-bool",
@@ -345,7 +364,7 @@ impl MockInstanceFactory {
     }
 
     /// Mock the exported functions from the "operations" module.
-    fn export_operations(&mut self, instance: &mut MockInstance) {
+    fn export_operations(&mut self, instance: &mut MockInstance<UserData>) {
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/operations#and-bool",
@@ -417,7 +436,7 @@ impl MockInstanceFactory {
     }
 
     /// Mock calling the imported function in the "import-simple-function" module.
-    fn import_simple_function(&mut self, instance: &mut MockInstance) {
+    fn import_simple_function(&mut self, instance: &mut MockInstance<UserData>) {
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/entrypoint#entrypoint",
@@ -433,9 +452,12 @@ impl MockInstanceFactory {
     }
 
     /// Mock calling the imported functions in the "import-getters" module.
-    fn import_getters(&mut self, instance: &mut MockInstance) {
-        fn check_getter<Value>(caller: &MockInstance, name: &str, expected_value: Value)
-        where
+    fn import_getters(&mut self, instance: &mut MockInstance<UserData>) {
+        fn check_getter<Value, UserData>(
+            caller: &MockInstance<UserData>,
+            name: &str,
+            expected_value: Value,
+        ) where
             Value: Debug + PartialEq + WitLoad + 'static,
         {
             let value: Value = caller
@@ -448,7 +470,6 @@ impl MockInstanceFactory {
             assert_eq!(value, expected_value);
         }
 
-        #[allow(clippy::bool_assert_comparison)]
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/entrypoint#entrypoint",
@@ -473,9 +494,12 @@ impl MockInstanceFactory {
     }
 
     /// Mock calling the imported functions in the "import-setters" module.
-    fn import_setters(&mut self, instance: &mut MockInstance) {
-        fn send_to_setter<Value>(caller: &MockInstance, name: &str, value: Value)
-        where
+    fn import_setters(&mut self, instance: &mut MockInstance<UserData>) {
+        fn send_to_setter<Value, UserData>(
+            caller: &MockInstance<UserData>,
+            name: &str,
+            value: Value,
+        ) where
             Value: WitStore + 'static,
             Value::Layout: Add<HList![]>,
             <Value::Layout as Add<HList![]>>::Output:
@@ -490,7 +514,6 @@ impl MockInstanceFactory {
                 .unwrap_or_else(|error| panic!("Failed to call setter function {name:?}: {error}"));
         }
 
-        #[allow(clippy::bool_assert_comparison)]
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/entrypoint#entrypoint",
@@ -514,9 +537,9 @@ impl MockInstanceFactory {
     }
 
     /// Mock calling the imported functions in the "import-operations".
-    fn import_operations(&mut self, instance: &mut MockInstance) {
-        fn check_operation<Value>(
-            caller: &MockInstance,
+    fn import_operations(&mut self, instance: &mut MockInstance<UserData>) {
+        fn check_operation<Value, UserData>(
+            caller: &MockInstance<UserData>,
             name: &str,
             operands: impl WitStore + 'static,
             expected_result: Value,
@@ -533,7 +556,6 @@ impl MockInstanceFactory {
             assert_eq!(result, expected_result);
         }
 
-        #[allow(clippy::bool_assert_comparison)]
         self.mock_exported_function(
             instance,
             "witty-macros:test-modules/entrypoint#entrypoint",
@@ -573,31 +595,31 @@ impl MockInstanceFactory {
     }
 
     /// Mock the behavior of the "reentrancy-simple-function" module.
-    fn reentrancy_simple_function(&mut self, instance: &mut MockInstance) {
+    fn reentrancy_simple_function(&mut self, instance: &mut MockInstance<UserData>) {
         self.import_simple_function(instance);
         self.export_simple_function(instance);
     }
 
     /// Mock the behavior of the "reentrancy-getters" module.
-    fn reentrancy_getters(&mut self, instance: &mut MockInstance) {
+    fn reentrancy_getters(&mut self, instance: &mut MockInstance<UserData>) {
         self.import_getters(instance);
         self.export_getters(instance);
     }
 
     /// Mock the behavior of the "reentrancy-setters" module.
-    fn reentrancy_setters(&mut self, instance: &mut MockInstance) {
+    fn reentrancy_setters(&mut self, instance: &mut MockInstance<UserData>) {
         self.import_setters(instance);
         self.export_setters(instance);
     }
 
     /// Mock the behavior of the "reentrancy-operations" module.
-    fn reentrancy_operations(&mut self, instance: &mut MockInstance) {
+    fn reentrancy_operations(&mut self, instance: &mut MockInstance<UserData>) {
         self.import_operations(instance);
         self.export_operations(instance);
     }
 
     /// Mock the behavior of the "reentrancy-global-state" module.
-    fn reentrancy_global_state(&mut self, instance: &mut MockInstance) {
+    fn reentrancy_global_state(&mut self, instance: &mut MockInstance<UserData>) {
         let global_state_for_entrypoint = Arc::new(AtomicU32::new(0));
         let global_state_for_getter = global_state_for_entrypoint.clone();
 
@@ -637,9 +659,9 @@ impl MockInstanceFactory {
     /// added to the current list of deferred assertions, to be checked when the test finishes.
     fn mock_exported_function<Parameters, Results>(
         &mut self,
-        instance: &mut MockInstance,
+        instance: &mut MockInstance<UserData>,
         name: &str,
-        handler: impl Fn(MockInstance, Parameters) -> Result<Results, RuntimeError> + 'static,
+        handler: impl Fn(MockInstance<UserData>, Parameters) -> Result<Results, RuntimeError> + 'static,
         expected_calls: usize,
     ) where
         Parameters: 'static,
@@ -655,6 +677,7 @@ impl MockInstanceFactory {
 }
 
 /// Marker type to indicate no extra functions should be exported to the Wasm instance.
+#[allow(dead_code)]
 pub struct WithoutExports;
 
 impl<T> ExportTo<T> for WithoutExports {

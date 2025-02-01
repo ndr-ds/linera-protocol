@@ -1,38 +1,44 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::transport::TransportProtocol;
 use linera_base::identifiers::ChainId;
+use linera_execution::committee::ValidatorName;
 use serde::{Deserialize, Serialize};
-use structopt::StructOpt;
 
-#[derive(Clone, Debug, StructOpt)]
+#[cfg(with_simple_network)]
+use crate::simple;
+
+#[derive(Clone, Debug, clap::Parser)]
 pub struct CrossChainConfig {
-    /// Number of cross-chains messages allowed before dropping them.
-    #[structopt(long = "cross-chain-queue-size", default_value = "1000")]
+    /// Number of cross-chain messages allowed before dropping them.
+    #[arg(long = "cross-chain-queue-size", default_value = "1000")]
     pub(crate) queue_size: usize,
 
     /// Maximum number of retries for a cross-chain message.
-    #[structopt(long = "cross-chain-max-retries", default_value = "10")]
+    #[arg(long = "cross-chain-max-retries", default_value = "10")]
     pub(crate) max_retries: u32,
 
     /// Delay before retrying of cross-chain message.
-    #[structopt(long = "cross-chain-retry-delay-ms", default_value = "2000")]
+    #[arg(long = "cross-chain-retry-delay-ms", default_value = "2000")]
     pub(crate) retry_delay_ms: u64,
 
     /// Introduce a delay before sending every cross-chain message (e.g. for testing purpose).
-    #[structopt(long = "cross-chain-sender-delay-ms", default_value = "0")]
+    #[arg(long = "cross-chain-sender-delay-ms", default_value = "0")]
     pub(crate) sender_delay_ms: u64,
 
     /// Drop cross-chain messages randomly at the given rate (0 <= rate < 1) (meant for testing).
-    #[structopt(long = "cross-chain-sender-failure-rate", default_value = "0.0")]
+    #[arg(long = "cross-chain-sender-failure-rate", default_value = "0.0")]
     pub(crate) sender_failure_rate: f32,
+
+    /// How many concurrent tasks to spawn for cross-chain message handling RPCs.
+    #[arg(long = "cross-chain-max-tasks", default_value = "10")]
+    pub(crate) max_concurrent_tasks: usize,
 }
 
-#[derive(Clone, Debug, StructOpt)]
+#[derive(Clone, Debug, clap::Parser)]
 pub struct NotificationConfig {
     /// Number of notifications allowed before blocking the main server loop
-    #[structopt(long = "notification-queue-size", default_value = "1000")]
+    #[arg(long = "notification-queue-size", default_value = "1000")]
     pub(crate) notification_queue_size: usize,
 }
 
@@ -64,15 +70,26 @@ impl ShardConfig {
 /// The network protocol.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NetworkProtocol {
-    Simple(TransportProtocol),
-    Grpc,
+    #[cfg(with_simple_network)]
+    Simple(simple::TransportProtocol),
+    Grpc(TlsConfig),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TlsConfig {
+    ClearText,
+    Tls,
 }
 
 impl NetworkProtocol {
     fn scheme(&self) -> &'static str {
         match self {
+            #[cfg(with_simple_network)]
             NetworkProtocol::Simple(transport) => transport.scheme(),
-            NetworkProtocol::Grpc => "http",
+            NetworkProtocol::Grpc(tls) => match tls {
+                TlsConfig::ClearText => "http",
+                TlsConfig::Tls => "https",
+            },
         }
     }
 }
@@ -86,6 +103,8 @@ pub type ValidatorPublicNetworkConfig = ValidatorPublicNetworkPreConfig<NetworkP
 /// The network configuration for all shards.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorInternalNetworkPreConfig<P> {
+    /// The name of the validator.
+    pub name: ValidatorName,
     /// The network protocol to use for all shards.
     pub protocol: P,
     /// The available shards. Each chain UID is mapped to a unique shard in the vector in
@@ -93,23 +112,36 @@ pub struct ValidatorInternalNetworkPreConfig<P> {
     pub shards: Vec<ShardConfig>,
     /// The host name of the proxy on the internal network (IP or hostname).
     pub host: String,
-    /// The port the proxy listens on on the internal network.
+    /// The port the proxy listens on the internal network.
     pub port: u16,
+    /// The host name of the proxy's metrics endpoint.
+    pub metrics_host: String,
+    /// The port of the proxy's metrics endpoint.
+    pub metrics_port: u16,
 }
 
 impl<P> ValidatorInternalNetworkPreConfig<P> {
     pub fn clone_with_protocol<Q>(&self, protocol: Q) -> ValidatorInternalNetworkPreConfig<Q> {
         ValidatorInternalNetworkPreConfig {
+            name: self.name,
             protocol,
             shards: self.shards.clone(),
             host: self.host.clone(),
             port: self.port,
+            metrics_host: self.metrics_host.clone(),
+            metrics_port: self.metrics_port,
         }
     }
 }
 
 impl ValidatorInternalNetworkConfig {
     pub fn proxy_address(&self) -> String {
+        format!("{}://{}:{}", self.protocol.scheme(), self.host, self.port)
+    }
+}
+
+impl ValidatorPublicNetworkConfig {
+    pub fn http_address(&self) -> String {
         format!("{}://{}:{}", self.protocol.scheme(), self.host, self.port)
     }
 }
@@ -133,10 +165,6 @@ impl<P> ValidatorPublicNetworkPreConfig<P> {
             port: self.port,
         }
     }
-
-    pub fn http_address(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
-    }
 }
 
 impl<P> std::fmt::Display for ValidatorPublicNetworkPreConfig<P>
@@ -151,8 +179,12 @@ where
 impl std::fmt::Display for NetworkProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetworkProtocol::Simple(protocol) => write!(f, "{}", protocol),
-            NetworkProtocol::Grpc => write!(f, "grpc"),
+            #[cfg(with_simple_network)]
+            NetworkProtocol::Simple(protocol) => write!(f, "{:?}", protocol),
+            NetworkProtocol::Grpc(tls) => match tls {
+                TlsConfig::ClearText => write!(f, "grpc"),
+                TlsConfig::Tls => write!(f, "grpcs"),
+            },
         }
     }
 }
@@ -165,10 +197,10 @@ where
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
+        let parts = s.split(':').collect::<Vec<_>>();
         anyhow::ensure!(
             parts.len() == 3,
-            "Expecting format `(tcp|udp|grpc):host:port`"
+            "Expecting format `(tcp|udp|grpc|grpcs):host:port`"
         );
         let protocol = parts[0].parse().map_err(|s| anyhow::anyhow!("{}", s))?;
         let host = parts[1].to_owned();
@@ -186,8 +218,12 @@ impl std::str::FromStr for NetworkProtocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let protocol = match s {
-            "grpc" => Self::Grpc,
-            _ => Self::Simple(TransportProtocol::from_str(s)?),
+            "grpc" => Self::Grpc(TlsConfig::ClearText),
+            "grpcs" => Self::Grpc(TlsConfig::Tls),
+            #[cfg(with_simple_network)]
+            s => Self::Simple(simple::TransportProtocol::from_str(s)?),
+            #[cfg(not(with_simple_network))]
+            s => return Err(format!("unsupported protocol: {s:?}")),
         };
         Ok(protocol)
     }
@@ -198,6 +234,8 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
     pub fn get_shard_id(&self, chain_id: ChainId) -> ShardId {
         use std::hash::{Hash, Hasher};
         let mut s = std::collections::hash_map::DefaultHasher::new();
+        // Use the validator public key to randomise shard assignment.
+        self.name.hash(&mut s);
         chain_id.hash(&mut s);
         (s.finish() as ShardId) % self.shards.len()
     }

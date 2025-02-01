@@ -1,42 +1,50 @@
 ## Motivation
 
-<!-- Short text indicating what this PR aims to accomplish. -->
+<!--
+Briefly describe the goal(s) of this PR.
+-->
 
 ## Proposal
 
-<!-- What are the proposed changes and why are they appropriate? -->
+<!--
+Summarize the proposed changes and how they address the goal(s) stated above.
+-->
 
 ## Test Plan
 
-<!-- How to test that the changes are correct. -->
+<!--
+Explain how you made sure that the changes are correct and that they perform as intended.
+
+Please describe testing protocols (CI, manual tests, benchmarks, etc) in a way that others
+can reproduce the results.
+-->
+
+## Release Plan
+
+<!--
+If this PR targets the `main` branch, **keep the applicable lines** to indicate if you
+recommend the changes to be picked in release branches, SDKs, and hotfixes.
+
+This generally concerns only bug fixes.
+
+Note that altering the public protocol (e.g. transaction format, WASM syscalls) or storage
+formats requires a new deployment.
+-->
+- Nothing to do / These changes follow the usual release cycle.
+- These changes should be backported to the latest `devnet` branch, then
+    - be released in a new SDK,
+    - be released in a validator hotfix.
+- These changes should be backported to the latest `testnet` branch, then
+    - be released in a new SDK,
+    - be released in a validator hotfix.
+- Backporting is not possible but we may want to deploy a new `devnet` and release a new
+      SDK soon.
 
 ## Links
 
 <!--
 Optional section for related PRs, related issues, and other references.
 
-Please create issues to track future improvements.
+If needed, please create issues to track future improvements and link them here.
 -->
-
-## Release Plan
-
-<!--
-How to safely release the changes. Please create issues to track future release work.
--->
-- [ ] All good!
-- [ ] Need to bump the major/minor version number in the next release of the crates.
-- [ ] Need to update the developer manual.
-- [ ] This PR is adding or removing Cargo features.
-- [ ] Release is blocked and/or tracked by other issues (see links above)
-
-## Reviewer Checklist
-
-- [ ] The title and the summary of the PR are short and descriptive.
-- [ ] The proposed solution achieves the goals stated in the PR.
-- [ ] The test plan is reproducible and provides sufficient coverage.
-- [ ] The release plan is adequate.
-- [ ] The commits correspond to distinct logical changes.
-- [ ] The code follows the [coding guidelines](https://github.com/linera-io/linera-protocol/blob/main/CONTRIBUTING.md).
-- [ ] The proposed changes look correct.
-- [ ] The CI is passing.
-- [ ] All of the above!
+- [reviewer checklist](https://github.com/linera-io/linera-protocol/blob/main/CONTRIBUTING.md#reviewer-checklist)

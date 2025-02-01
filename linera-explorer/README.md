@@ -2,28 +2,26 @@
 
 <!-- cargo-rdme start -->
 
-This module provides web files to run a block explorer from linera service node.
+This module provides web files to run a block explorer from Linera service node and Linera indexer.
 
 <!-- cargo-rdme end -->
 
 ## Build instructions
 
-After building linera with `cargo`, run
 ```bash
-npm i
+npm install
 ```
 and then
-```
-webpack
-```
-It will create a `dist` folder from where you can run an HTTP server
-
-## Generate schema
-
-To generate the linera service GraphQL schema, a binary `linera-export-schema` is available:
 ```bash
-target/debug/linera-schema-export > linera-explorer/graphql/schema.graphql
+npm run full
 ```
+
+Then, to serve the web application on a local server, run:
+```bash
+npm run serve
+```
+
+The URL to access the Block Explorer will be printed.
 
 ## Contributing
 

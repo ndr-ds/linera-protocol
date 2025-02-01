@@ -4,13 +4,13 @@
 
 //! This module provides the executables needed to operate a Linera service, including a placeholder wallet acting as a GraphQL service for user interfaces.
 
-pub mod chain_listener;
-pub mod client;
-pub mod config;
-pub mod grpc_proxy;
-#[cfg(feature = "kube")]
-pub mod kubernetes;
+#![deny(clippy::large_futures)]
+
+pub mod cli_wrappers;
+pub mod faucet;
 pub mod node_service;
 pub mod project;
-pub mod storage;
+#[cfg(with_metrics)]
+pub mod prometheus_server;
 pub mod util;
+pub mod wallet;

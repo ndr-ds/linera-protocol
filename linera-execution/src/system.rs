@@ -2,81 +2,113 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    committee::{Committee, Epoch},
-    ApplicationRegistryView, Bytecode, BytecodeLocation, ChainOwnership, ChannelName,
-    ChannelSubscription, Destination, MessageContext, OperationContext, QueryContext,
-    RawExecutionResult, RawOutgoingMessage, UserApplicationDescription, UserApplicationId,
-};
-use async_graphql::Enum;
-use custom_debug_derive::Debug;
-use linera_base::{
-    crypto::{CryptoHash, PublicKey},
-    data_types::{Amount, ArithmeticError, Timestamp},
-    ensure, hex_debug,
-    identifiers::{BytecodeId, ChainDescription, ChainId, MessageId, Owner},
-};
-use linera_views::{
-    common::Context,
-    map_view::MapView,
-    register_view::RegisterView,
-    set_view::SetView,
-    views::{HashableView, View, ViewError},
-};
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+#[path = "./unit_tests/system_tests.rs"]
+mod tests;
+
+#[cfg(with_metrics)]
+use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     fmt::{self, Display, Formatter},
     iter,
-    str::FromStr,
 };
-use thiserror::Error;
 
-#[cfg(any(test, feature = "test"))]
-use {crate::applications::ApplicationRegistry, std::collections::BTreeSet};
+use async_graphql::Enum;
+use custom_debug_derive::Debug;
+use linera_base::{
+    crypto::CryptoHash,
+    data_types::{
+        Amount, ApplicationPermissions, ArithmeticError, BlobContent, OracleResponse, Timestamp,
+    },
+    ensure, hex_debug,
+    identifiers::{
+        Account, AccountOwner, BlobId, BlobType, BytecodeId, ChainDescription, ChainId, MessageId,
+        Owner,
+    },
+    ownership::{ChainOwnership, TimeoutConfig},
+};
+use linera_views::{
+    context::Context,
+    map_view::HashedMapView,
+    register_view::HashedRegisterView,
+    set_view::HashedSetView,
+    views::{ClonableView, HashableView, View, ViewError},
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+#[cfg(with_metrics)]
+use {linera_base::prometheus_util::register_int_counter_vec, prometheus::IntCounterVec};
+
+#[cfg(test)]
+use crate::test_utils::SystemExecutionState;
+use crate::{
+    committee::{Committee, Epoch},
+    ApplicationRegistryView, ChannelName, ChannelSubscription, Destination,
+    ExecutionRuntimeContext, MessageContext, MessageKind, OperationContext, QueryContext,
+    QueryOutcome, RawExecutionOutcome, RawOutgoingMessage, TransactionTracker,
+    UserApplicationDescription, UserApplicationId,
+};
+
+/// The relative index of the `OpenChain` message created by the `OpenChain` operation.
+pub static OPEN_CHAIN_MESSAGE_INDEX: u32 = 0;
+/// The relative index of the `ApplicationCreated` message created by the `CreateApplication`
+/// operation.
+pub static CREATE_APPLICATION_MESSAGE_INDEX: u32 = 0;
+
+/// The number of times the [`SystemOperation::OpenChain`] was executed.
+#[cfg(with_metrics)]
+static OPEN_CHAIN_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec(
+        "open_chain_count",
+        "The number of times the `OpenChain` operation was executed",
+        &[],
+    )
+});
 
 /// A view accessing the execution state of the system of a chain.
-#[derive(Debug, HashableView)]
+#[derive(Debug, ClonableView, HashableView)]
 pub struct SystemExecutionStateView<C> {
     /// How the chain was created. May be unknown for inactive chains.
-    pub description: RegisterView<C, Option<ChainDescription>>,
+    pub description: HashedRegisterView<C, Option<ChainDescription>>,
     /// The number identifying the current configuration.
-    pub epoch: RegisterView<C, Option<Epoch>>,
+    pub epoch: HashedRegisterView<C, Option<Epoch>>,
     /// The admin of the chain.
-    pub admin_id: RegisterView<C, Option<ChainId>>,
+    pub admin_id: HashedRegisterView<C, Option<ChainId>>,
     /// Track the channels that we have subscribed to.
-    pub subscriptions: SetView<C, ChannelSubscription>,
+    pub subscriptions: HashedSetView<C, ChannelSubscription>,
     /// The committees that we trust, indexed by epoch number.
-    /// Not using a `MapView` because the set active of committees is supposed to be
-    /// small. Plus, currently, we would create the `BTreeMap` anyway in various places
-    /// (e.g. the `OpenChain` operation).
-    pub committees: RegisterView<C, BTreeMap<Epoch, Committee>>,
+    // Not using a `MapView` because the set active of committees is supposed to be
+    // small. Plus, currently, we would create the `BTreeMap` anyway in various places
+    // (e.g. the `OpenChain` operation).
+    pub committees: HashedRegisterView<C, BTreeMap<Epoch, Committee>>,
     /// Ownership of the chain.
-    pub ownership: RegisterView<C, ChainOwnership>,
-    /// Balance of the chain (unattributed).
-    pub balance: RegisterView<C, Amount>,
+    pub ownership: HashedRegisterView<C, ChainOwnership>,
+    /// Balance of the chain. (Available to any user able to create blocks in the chain.)
+    pub balance: HashedRegisterView<C, Amount>,
     /// Balances attributed to a given owner.
-    pub balances: MapView<C, Owner, Amount>,
+    pub balances: HashedMapView<C, AccountOwner, Amount>,
     /// The timestamp of the most recent block.
-    pub timestamp: RegisterView<C, Timestamp>,
+    pub timestamp: HashedRegisterView<C, Timestamp>,
     /// Track the locations of known bytecodes as well as the descriptions of known applications.
     pub registry: ApplicationRegistryView<C>,
+    /// Whether this chain has been closed.
+    pub closed: HashedRegisterView<C, bool>,
+    /// Permissions for applications on this chain.
+    pub application_permissions: HashedRegisterView<C, ApplicationPermissions>,
+    /// Blobs that have been used or published on this chain.
+    pub used_blobs: HashedSetView<C, BlobId>,
 }
 
-/// For testing only.
-#[cfg(any(test, feature = "test"))]
-#[derive(Default, Debug, PartialEq, Eq, Clone)]
-pub struct SystemExecutionState {
-    pub description: Option<ChainDescription>,
-    pub epoch: Option<Epoch>,
-    pub admin_id: Option<ChainId>,
-    pub subscriptions: BTreeSet<ChannelSubscription>,
-    pub committees: BTreeMap<Epoch, Committee>,
+/// The configuration for a new chain.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct OpenChainConfig {
     pub ownership: ChainOwnership,
+    pub admin_id: ChainId,
+    pub epoch: Epoch,
+    pub committees: BTreeMap<Epoch, Committee>,
     pub balance: Amount,
-    pub balances: BTreeMap<Owner, Amount>,
-    pub timestamp: Timestamp,
-    pub registry: ApplicationRegistry,
+    pub application_permissions: ApplicationPermissions,
 }
 
 /// A system operation.
@@ -85,35 +117,44 @@ pub enum SystemOperation {
     /// Transfers `amount` units of value from the given owner's account to the recipient.
     /// If no owner is given, try to take the units out of the unattributed account.
     Transfer {
+        #[debug(skip_if = Option::is_none)]
         owner: Option<Owner>,
         recipient: Recipient,
         amount: Amount,
-        user_data: UserData,
     },
-    /// Claims `amount` units of value from the given owner's account in
-    /// the remote `target` chain. Depending on its configuration (see also #464), the
-    /// `target` chain may refuse to process the message.
+    /// Claims `amount` units of value from the given owner's account in the remote
+    /// `target` chain. Depending on its configuration, the `target` chain may refuse to
+    /// process the message.
     Claim {
         owner: Owner,
-        target: ChainId,
+        target_id: ChainId,
         recipient: Recipient,
         amount: Amount,
-        user_data: UserData,
     },
     /// Creates (or activates) a new chain.
     /// This will automatically subscribe to the future committees created by `admin_id`.
-    OpenChain {
-        ownership: ChainOwnership,
-        admin_id: ChainId,
-        epoch: Epoch,
-        committees: BTreeMap<Epoch, Committee>,
-    },
+    OpenChain(OpenChainConfig),
     /// Closes the chain.
     CloseChain,
-    /// Changes the authentication key of the chain.
-    ChangeOwner { new_public_key: PublicKey },
-    /// Changes the authentication key of the chain.
-    ChangeMultipleOwners { new_public_keys: Vec<PublicKey> },
+    /// Changes the ownership of the chain.
+    ChangeOwnership {
+        /// Super owners can propose fast blocks in the first round, and regular blocks in any round.
+        #[debug(skip_if = Vec::is_empty)]
+        super_owners: Vec<Owner>,
+        /// The regular owners, with their weights that determine how often they are round leader.
+        #[debug(skip_if = Vec::is_empty)]
+        owners: Vec<(Owner, u64)>,
+        /// The number of initial rounds after 0 in which all owners are allowed to propose blocks.
+        multi_leader_rounds: u32,
+        /// Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners.
+        /// This should only be `true` on chains with restrictive application permissions and an
+        /// application-based mechanism to select block proposers.
+        open_multi_leader_rounds: bool,
+        /// The timeout configuration: how long fast, multi-leader and single-leader rounds last.
+        timeout_config: TimeoutConfig,
+    },
+    /// Changes the application permissions configuration on this chain.
+    ChangeApplicationPermissions(ApplicationPermissions),
     /// Subscribes to a system channel.
     Subscribe {
         chain_id: ChainId,
@@ -125,10 +166,12 @@ pub enum SystemOperation {
         channel: SystemChannel,
     },
     /// Publishes a new application bytecode.
-    PublishBytecode {
-        contract: Bytecode,
-        service: Bytecode,
-    },
+    PublishBytecode { bytecode_id: BytecodeId },
+    /// Publishes a new data blob.
+    PublishDataBlob { blob_hash: CryptoHash },
+    /// Reads a blob and discards the result.
+    // TODO(#2490): Consider removing this.
+    ReadBlob { blob_id: BlobId },
     /// Creates a new application.
     CreateApplication {
         bytecode_id: BytecodeId,
@@ -136,8 +179,9 @@ pub enum SystemOperation {
         #[debug(with = "hex_debug")]
         parameters: Vec<u8>,
         #[serde(with = "serde_bytes")]
-        #[debug(with = "hex_debug")]
-        initialization_argument: Vec<u8>,
+        #[debug(with = "hex_debug", skip_if = Vec::is_empty)]
+        instantiation_argument: Vec<u8>,
+        #[debug(skip_if = Vec::is_empty)]
         required_application_ids: Vec<UserApplicationId>,
     },
     /// Requests a message from another chain to register a user application on this chain.
@@ -153,10 +197,10 @@ pub enum SystemOperation {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum AdminOperation {
     /// Registers a new committee. This will notify the subscribers of the admin chain so that they
-    /// can migrate to the new epoch by accepting the resulting `SetCommittees` as an incoming
+    /// can migrate to the new epoch by accepting the resulting `CreateCommittee` as an incoming
     /// message in a block.
     CreateCommittee { epoch: Epoch, committee: Committee },
-    /// Removes a committee. Once the resulting `SetCommittees` message is accepted by a chain,
+    /// Removes a committee. Once the resulting `RemoveCommittee` message is accepted by a chain,
     /// blocks from the retired epoch will not be accepted until they are followed (hence
     /// re-certified) by a block certified by a recent committee.
     RemoveCommittee { epoch: Epoch },
@@ -165,29 +209,29 @@ pub enum AdminOperation {
 /// A system message meant to be executed on a remote chain.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum SystemMessage {
-    /// Credits `amount` units of value to the account.
-    Credit { account: Account, amount: Amount },
+    /// Credits `amount` units of value to the account `target` -- unless the message is
+    /// bouncing, in which case `source` is credited instead.
+    Credit {
+        #[debug(skip_if = Option::is_none)]
+        target: Option<AccountOwner>,
+        amount: Amount,
+        #[debug(skip_if = Option::is_none)]
+        source: Option<AccountOwner>,
+    },
     /// Withdraws `amount` units of value from the account and starts a transfer to credit
     /// the recipient. The message must be properly authenticated. Receiver chains may
     /// refuse it depending on their configuration.
     Withdraw {
-        account: Account,
+        owner: AccountOwner,
         amount: Amount,
         recipient: Recipient,
-        user_data: UserData,
     },
     /// Creates (or activates) a new chain.
-    OpenChain {
-        ownership: ChainOwnership,
-        admin_id: ChainId,
-        epoch: Epoch,
-        committees: BTreeMap<Epoch, Committee>,
-    },
-    /// Sets the current epoch and the recognized committees.
-    SetCommittees {
-        epoch: Epoch,
-        committees: BTreeMap<Epoch, Committee>,
-    },
+    OpenChain(OpenChainConfig),
+    /// Adds a new epoch and committee.
+    CreateCommittee { epoch: Epoch, committee: Committee },
+    /// Removes an old committee.
+    RemoveCommittee { epoch: Epoch },
     /// Subscribes to a channel.
     Subscribe {
         id: ChainId,
@@ -198,57 +242,16 @@ pub enum SystemMessage {
         id: ChainId,
         subscription: ChannelSubscription,
     },
-    /// Notifies that a new application bytecode was published.
-    BytecodePublished { operation_index: u32 },
     /// Notifies that a new application was created.
     ApplicationCreated,
-    /// Shares the locations of published bytecodes.
-    BytecodeLocations {
-        locations: Vec<(BytecodeId, BytecodeLocation)>,
-    },
     /// Shares information about some applications to help the recipient use them.
     /// Applications must be registered after their dependencies.
     RegisterApplications {
         applications: Vec<UserApplicationDescription>,
     },
-    /// Does nothing. Used to debug the intended recipients of a block.
-    Notify { id: ChainId },
     /// Requests a `RegisterApplication` message from the target chain to register the specified
     /// application on the sender chain.
     RequestApplication(UserApplicationId),
-}
-
-impl SystemMessage {
-    /// Returns an iterator over all bytecode locations this message introduces to the receiving
-    /// chain, given the hash of the certificate that it originates from.
-    pub fn bytecode_locations(
-        &self,
-        certificate_hash: CryptoHash,
-    ) -> Box<dyn Iterator<Item = BytecodeLocation> + '_> {
-        match self {
-            SystemMessage::BytecodePublished { operation_index } => {
-                Box::new(iter::once(BytecodeLocation {
-                    certificate_hash,
-                    operation_index: *operation_index,
-                }))
-            }
-            SystemMessage::BytecodeLocations {
-                locations: new_locations,
-            } => Box::new(new_locations.iter().map(|(_id, location)| *location)),
-            SystemMessage::RegisterApplications { applications } => {
-                Box::new(applications.iter().map(|app| app.bytecode_location))
-            }
-            SystemMessage::Credit { .. }
-            | SystemMessage::Withdraw { .. }
-            | SystemMessage::OpenChain { .. }
-            | SystemMessage::SetCommittees { .. }
-            | SystemMessage::Subscribe { .. }
-            | SystemMessage::Unsubscribe { .. }
-            | SystemMessage::ApplicationCreated { .. }
-            | SystemMessage::Notify { .. }
-            | SystemMessage::RequestApplication(_) => Box::new(iter::empty()),
-        }
-    }
 }
 
 /// A query to the system state.
@@ -263,12 +266,12 @@ pub struct SystemResponse {
 }
 
 /// The channels available in the system application.
-#[derive(Enum, Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(
+    Enum, Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, clap::ValueEnum,
+)]
 pub enum SystemChannel {
     /// Channel used to broadcast reconfigurations.
     Admin,
-    /// Channel used to broadcast new published bytecodes.
-    PublishedBytecodes,
 }
 
 impl SystemChannel {
@@ -284,7 +287,6 @@ impl Display for SystemChannel {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         let display_name = match self {
             SystemChannel::Admin => "Admin",
-            SystemChannel::PublishedBytecodes => "PublishedBytecodes",
         };
 
         write!(formatter, "{display_name}")
@@ -296,8 +298,7 @@ impl Display for SystemChannel {
 pub enum Recipient {
     /// This is mainly a placeholder for future extensions.
     Burn,
-    /// Transfers to the system balance of the given owner (or any owner) at the given
-    /// chain.
+    /// Transfers to the balance of the given account.
     Account(Account),
 }
 
@@ -308,62 +309,9 @@ impl Recipient {
     }
 
     /// Returns the default recipient for the root chain with the given index.
-    #[cfg(any(test, feature = "test"))]
+    #[cfg(with_testing)]
     pub fn root(index: u32) -> Recipient {
         Recipient::chain(ChainId::root(index))
-    }
-}
-
-/// A system account.
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, Serialize, Deserialize)]
-pub struct Account {
-    /// The chain of the account.
-    pub chain_id: ChainId,
-    /// The owner of the account.
-    pub owner: Option<Owner>,
-}
-
-impl Account {
-    pub fn chain(chain_id: ChainId) -> Self {
-        Account {
-            chain_id,
-            owner: None,
-        }
-    }
-
-    pub fn owner(chain_id: ChainId, owner: Owner) -> Self {
-        Account {
-            chain_id,
-            owner: Some(owner),
-        }
-    }
-}
-
-impl std::fmt::Display for Account {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.owner {
-            Some(owner) => write!(f, "{}:{}", self.chain_id, owner),
-            None => write!(f, "{}", self.chain_id),
-        }
-    }
-}
-
-impl FromStr for Account {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        anyhow::ensure!(
-            parts.len() <= 2,
-            "Expecting format `chain-id:address` or `chain-id`"
-        );
-        if parts.len() == 1 {
-            Ok(Account::chain(s.parse()?))
-        } else {
-            let chain_id = parts[0].parse()?;
-            let owner = parts[1].parse()?;
-            Ok(Account::owner(chain_id, owner))
-        }
     }
 }
 
@@ -371,16 +319,49 @@ impl FromStr for Account {
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Default, Debug, Serialize, Deserialize)]
 pub struct UserData(pub Option<[u8; 32]>);
 
+impl UserData {
+    pub fn from_option_string(opt_str: Option<String>) -> Result<Self, usize> {
+        // Convert the Option<String> to Option<[u8; 32]>
+        let option_array = match opt_str {
+            Some(s) => {
+                // Convert the String to a Vec<u8>
+                let vec = s.into_bytes();
+                if vec.len() <= 32 {
+                    // Create an array from the Vec<u8>
+                    let mut array = [b' '; 32];
+
+                    // Copy bytes from the vector into the array
+                    let len = vec.len().min(32);
+                    array[..len].copy_from_slice(&vec[..len]);
+
+                    Some(array)
+                } else {
+                    return Err(vec.len());
+                }
+            }
+            None => None,
+        };
+
+        // Return the UserData with the converted Option<[u8; 32]>
+        Ok(UserData(option_array))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateApplicationResult {
+    pub app_id: UserApplicationId,
+    pub message: RawOutgoingMessage<SystemMessage, Amount>,
+    pub blobs_to_register: Vec<BlobId>,
+}
+
 #[derive(Error, Debug)]
 pub enum SystemExecutionError {
     #[error(transparent)]
     ArithmeticError(#[from] ArithmeticError),
     #[error(transparent)]
-    ViewError(#[from] ViewError),
+    ViewError(ViewError),
 
-    #[error("Invalid new chain id: {0}")]
-    InvalidNewChainId(ChainId),
-    #[error("Invalid admin id in new chain: {0}")]
+    #[error("Invalid admin ID in new chain: {0}")]
     InvalidNewChainAdminId(ChainId),
     #[error("Invalid committees")]
     InvalidCommittees,
@@ -390,10 +371,10 @@ pub enum SystemExecutionError {
     IncorrectTransferAmount,
     #[error("Transfer from owned account must be authenticated by the right signer")]
     UnauthenticatedTransferOwner,
-    #[error(
-        "The transferred amount must be not exceed the current chain balance: {current_balance}"
-    )]
-    InsufficientFunding { current_balance: Amount },
+    #[error("The transferred amount must not exceed the current chain balance: {balance}")]
+    InsufficientFunding { balance: Amount },
+    #[error("Required execution fees exceeded the total funding available: {balance}")]
+    InsufficientFundingForFees { balance: Amount },
     #[error("Claim must have positive amount")]
     IncorrectClaimAmount,
     #[error("Claim must be authenticated by the right signer")]
@@ -405,13 +386,13 @@ pub enum SystemExecutionError {
     #[error("Failed to remove committee")]
     InvalidCommitteeRemoval,
     #[error(
-        "Attempted to subscribe to the admin channel ({1}) of this chain's ({0}) admin chain {1}"
+        "Chain {0} tried to subscribe to the admin channel ({1}) of a chain that is not the admin chain"
     )]
     InvalidAdminSubscription(ChainId, SystemChannel),
-    #[error("Attempted to subscribe to self on channel {1} on chain {0}")]
+    #[error("Cannot subscribe to a channel ({1}) on the same chain ({0})")]
     SelfSubscription(ChainId, SystemChannel),
-    #[error("Attempted to subscribe to a channel which does not exist ({1}) on chain {0}")]
-    NoSuchChannel(ChainId, SystemChannel),
+    #[error("Chain {0} tried to subscribe to channel {1} but it is already subscribed")]
+    AlreadySubscribedToChannel(ChainId, SystemChannel),
     #[error("Invalid unsubscription request to channel {1} on chain {0}")]
     InvalidUnsubscription(ChainId, SystemChannel),
     #[error("Amount overflow")]
@@ -426,16 +407,32 @@ pub enum SystemExecutionError {
     CannotRewindEpoch,
     #[error("Cannot decrease the chain's timestamp")]
     TicksOutOfOrder,
-    #[error("Attempt to create an application using unregistered bytecode identifier {0:?}")]
-    UnknownBytecodeId(BytecodeId),
     #[error("Application {0:?} is not registered by the chain")]
     UnknownApplicationId(Box<UserApplicationId>),
+    #[error("Chain is not active yet.")]
+    InactiveChain,
+
+    #[error("Blobs not found: {0:?}")]
+    BlobsNotFound(Vec<BlobId>),
+    #[error("Oracle response mismatch")]
+    OracleResponseMismatch,
+    #[error("No recorded response for oracle query")]
+    MissingOracleResponse,
+}
+
+impl From<ViewError> for SystemExecutionError {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::BlobsNotFound(blob_ids) => SystemExecutionError::BlobsNotFound(blob_ids),
+            error => SystemExecutionError::ViewError(error),
+        }
+    }
 }
 
 impl<C> SystemExecutionStateView<C>
 where
     C: Context + Clone + Send + Sync + 'static,
-    ViewError: From<C::Error>,
+    C::Extra: ExecutionRuntimeContext,
 {
     /// Invariant for the states of active chains.
     pub fn is_active(&self) -> bool {
@@ -456,90 +453,46 @@ where
     /// taken.
     pub async fn execute_operation(
         &mut self,
-        context: &OperationContext,
-        operation: &SystemOperation,
-    ) -> Result<
-        (
-            RawExecutionResult<SystemMessage>,
-            Option<(UserApplicationId, Vec<u8>)>,
-        ),
-        SystemExecutionError,
-    > {
+        context: OperationContext,
+        operation: SystemOperation,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<Option<(UserApplicationId, Vec<u8>)>, SystemExecutionError> {
         use SystemOperation::*;
-        let mut result = RawExecutionResult::default();
+        let mut outcome = RawExecutionOutcome {
+            authenticated_signer: context.authenticated_signer,
+            refund_grant_to: context.refund_grant_to(),
+            ..RawExecutionOutcome::default()
+        };
         let mut new_application = None;
         match operation {
-            OpenChain {
-                ownership,
-                committees,
-                admin_id,
-                epoch,
+            OpenChain(config) => {
+                let next_message_id = context.next_message_id(txn_tracker.next_message_index());
+                let messages = self.open_chain(config, next_message_id).await?;
+                outcome.messages.extend(messages);
+                #[cfg(with_metrics)]
+                OPEN_CHAIN_COUNT.with_label_values(&[]).inc();
+            }
+            ChangeOwnership {
+                super_owners,
+                owners,
+                multi_leader_rounds,
+                open_multi_leader_rounds,
+                timeout_config,
             } => {
-                let child_id = ChainId::child(context.next_message_id());
-                ensure!(
-                    self.admin_id.get().as_ref() == Some(admin_id),
-                    SystemExecutionError::InvalidNewChainAdminId(child_id)
-                );
-                ensure!(
-                    self.committees.get() == committees,
-                    SystemExecutionError::InvalidCommittees
-                );
-                ensure!(
-                    self.epoch.get().as_ref() == Some(epoch),
-                    SystemExecutionError::InvalidEpoch {
-                        chain_id: child_id,
-                        epoch: *epoch
-                    }
-                );
-                let e1 = RawOutgoingMessage {
-                    destination: Destination::Recipient(child_id),
-                    authenticated: false,
-                    message: SystemMessage::OpenChain {
-                        ownership: ownership.clone(),
-                        committees: committees.clone(),
-                        admin_id: *admin_id,
-                        epoch: *epoch,
-                    },
-                };
-                let subscription = ChannelSubscription {
-                    chain_id: *admin_id,
-                    name: SystemChannel::Admin.name(),
-                };
-                let e2 = RawOutgoingMessage {
-                    destination: Destination::Recipient(*admin_id),
-                    authenticated: false,
-                    message: SystemMessage::Subscribe {
-                        id: child_id,
-                        subscription,
-                    },
-                };
-                result.messages.extend([e1, e2]);
+                self.ownership.set(ChainOwnership {
+                    super_owners: super_owners.into_iter().collect(),
+                    owners: owners.into_iter().collect(),
+                    multi_leader_rounds,
+                    open_multi_leader_rounds,
+                    timeout_config,
+                });
             }
-            ChangeOwner { new_public_key } => {
-                self.ownership.set(ChainOwnership::single(*new_public_key));
-            }
-            ChangeMultipleOwners { new_public_keys } => {
-                self.ownership
-                    .set(ChainOwnership::multiple(new_public_keys.iter().cloned()));
+            ChangeApplicationPermissions(application_permissions) => {
+                self.application_permissions.set(application_permissions);
             }
             CloseChain => {
-                self.ownership.set(ChainOwnership::default());
-                // Unsubscribe to all channels.
-                self.subscriptions
-                    .for_each_index(|subscription| {
-                        let message = RawOutgoingMessage {
-                            destination: Destination::Recipient(subscription.chain_id),
-                            authenticated: false,
-                            message: SystemMessage::Unsubscribe {
-                                id: context.chain_id,
-                                subscription,
-                            },
-                        };
-                        result.messages.push(message);
-                        Ok(())
-                    })
-                    .await?;
-                self.subscriptions.clear();
+                let messages = self.close_chain(context.chain_id).await?;
+                outcome.messages.extend(messages);
             }
             Transfer {
                 owner,
@@ -547,68 +500,38 @@ where
                 recipient,
                 ..
             } => {
-                if owner.is_some() {
-                    ensure!(
-                        &context.authenticated_signer == owner,
-                        SystemExecutionError::UnauthenticatedTransferOwner
-                    );
-                }
-                ensure!(
-                    *amount > Amount::ZERO,
-                    SystemExecutionError::IncorrectTransferAmount
-                );
-                let balance = match &owner {
-                    Some(owner) => self.balances.get_mut_or_default(owner).await?,
-                    None => self.balance.get_mut(),
-                };
-                ensure!(
-                    *balance >= *amount,
-                    SystemExecutionError::InsufficientFunding {
-                        current_balance: *balance
-                    }
-                );
-                balance.try_sub_assign(*amount)?;
-                if let Recipient::Account(account) = recipient {
-                    let message = RawOutgoingMessage {
-                        destination: Destination::Recipient(account.chain_id),
-                        authenticated: false,
-                        message: SystemMessage::Credit {
-                            amount: *amount,
-                            account: *account,
-                        },
-                    };
-                    result.messages.push(message);
+                let message = self
+                    .transfer(
+                        context.authenticated_signer,
+                        None,
+                        owner.map(AccountOwner::User),
+                        recipient,
+                        amount,
+                    )
+                    .await?;
+
+                if let Some(message) = message {
+                    outcome.messages.push(message)
                 }
             }
             Claim {
                 owner,
-                target,
+                target_id,
                 recipient,
                 amount,
-                user_data,
             } => {
-                ensure!(
-                    context.authenticated_signer.as_ref() == Some(owner),
-                    SystemExecutionError::UnauthenticatedClaimOwner
-                );
-                ensure!(
-                    *amount > Amount::ZERO,
-                    SystemExecutionError::IncorrectClaimAmount
-                );
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*target),
-                    authenticated: true,
-                    message: SystemMessage::Withdraw {
-                        amount: *amount,
-                        account: Account {
-                            chain_id: *target,
-                            owner: Some(*owner),
-                        },
-                        user_data: user_data.clone(),
-                        recipient: *recipient,
-                    },
-                };
-                result.messages.push(message);
+                let message = self
+                    .claim(
+                        context.authenticated_signer,
+                        None,
+                        AccountOwner::User(owner),
+                        target_id,
+                        recipient,
+                        amount,
+                    )
+                    .await?;
+
+                outcome.messages.push(message)
             }
             Admin(admin_operation) => {
                 ensure!(
@@ -618,310 +541,386 @@ where
                 match admin_operation {
                     AdminOperation::CreateCommittee { epoch, committee } => {
                         ensure!(
-                            *epoch == self.epoch.get().expect("chain is active").try_add_one()?,
+                            epoch == self.epoch.get().expect("chain is active").try_add_one()?,
                             SystemExecutionError::InvalidCommitteeCreation
                         );
-                        self.committees.get_mut().insert(*epoch, committee.clone());
-                        self.epoch.set(Some(*epoch));
+                        self.committees.get_mut().insert(epoch, committee.clone());
+                        self.epoch.set(Some(epoch));
                         let message = RawOutgoingMessage {
                             destination: Destination::Subscribers(SystemChannel::Admin.name()),
                             authenticated: false,
-                            message: SystemMessage::SetCommittees {
-                                epoch: *epoch,
-                                committees: self.committees.get().clone(),
-                            },
+                            grant: Amount::ZERO,
+                            kind: MessageKind::Protected,
+                            message: SystemMessage::CreateCommittee { epoch, committee },
                         };
-                        result.messages.push(message);
+                        outcome.messages.push(message);
                     }
                     AdminOperation::RemoveCommittee { epoch } => {
                         ensure!(
-                            self.committees.get_mut().remove(epoch).is_some(),
+                            self.committees.get_mut().remove(&epoch).is_some(),
                             SystemExecutionError::InvalidCommitteeRemoval
                         );
                         let message = RawOutgoingMessage {
                             destination: Destination::Subscribers(SystemChannel::Admin.name()),
                             authenticated: false,
-                            message: SystemMessage::SetCommittees {
-                                epoch: self.epoch.get().expect("chain is active"),
-                                committees: self.committees.get().clone(),
-                            },
+                            grant: Amount::ZERO,
+                            kind: MessageKind::Protected,
+                            message: SystemMessage::RemoveCommittee { epoch },
                         };
-                        result.messages.push(message);
+                        outcome.messages.push(message);
                     }
                 }
             }
             Subscribe { chain_id, channel } => {
                 ensure!(
-                    context.chain_id != *chain_id,
-                    SystemExecutionError::SelfSubscription(context.chain_id, *channel)
+                    context.chain_id != chain_id,
+                    SystemExecutionError::SelfSubscription(context.chain_id, channel)
                 );
-                if *channel == SystemChannel::Admin {
+                if channel == SystemChannel::Admin {
                     ensure!(
-                        self.admin_id.get().as_ref() == Some(chain_id),
-                        SystemExecutionError::InvalidAdminSubscription(context.chain_id, *channel)
+                        self.admin_id.get().as_ref() == Some(&chain_id),
+                        SystemExecutionError::InvalidAdminSubscription(context.chain_id, channel)
                     );
                 }
                 let subscription = ChannelSubscription {
-                    chain_id: *chain_id,
+                    chain_id,
                     name: channel.name(),
                 };
                 ensure!(
                     !self.subscriptions.contains(&subscription).await?,
-                    SystemExecutionError::NoSuchChannel(context.chain_id, *channel)
+                    SystemExecutionError::AlreadySubscribedToChannel(context.chain_id, channel)
                 );
                 self.subscriptions.insert(&subscription)?;
                 let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*chain_id),
+                    destination: Destination::Recipient(chain_id),
                     authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Protected,
                     message: SystemMessage::Subscribe {
                         id: context.chain_id,
                         subscription,
                     },
                 };
-                result.messages.push(message);
+                outcome.messages.push(message);
             }
             Unsubscribe { chain_id, channel } => {
                 let subscription = ChannelSubscription {
-                    chain_id: *chain_id,
+                    chain_id,
                     name: channel.name(),
                 };
                 ensure!(
                     self.subscriptions.contains(&subscription).await?,
-                    SystemExecutionError::InvalidUnsubscription(context.chain_id, *channel)
+                    SystemExecutionError::InvalidUnsubscription(context.chain_id, channel)
                 );
                 self.subscriptions.remove(&subscription)?;
                 let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*chain_id),
+                    destination: Destination::Recipient(chain_id),
                     authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Protected,
                     message: SystemMessage::Unsubscribe {
                         id: context.chain_id,
                         subscription,
                     },
                 };
-                result.messages.push(message);
+                outcome.messages.push(message);
             }
-            PublishBytecode { .. } => {
-                // Send a `BytecodePublished` message to ourself so that we can broadcast
-                // the bytecode-id next.
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(context.chain_id),
-                    authenticated: false,
-                    message: SystemMessage::BytecodePublished {
-                        operation_index: context.index,
-                    },
-                };
-                result.messages.push(message);
+            PublishBytecode { bytecode_id } => {
+                self.blob_published(&BlobId::new(
+                    bytecode_id.contract_blob_hash,
+                    BlobType::ContractBytecode,
+                ))?;
+                self.blob_published(&BlobId::new(
+                    bytecode_id.service_blob_hash,
+                    BlobType::ServiceBytecode,
+                ))?;
             }
             CreateApplication {
                 bytecode_id,
                 parameters,
-                initialization_argument,
+                instantiation_argument,
                 required_application_ids,
             } => {
-                let id = UserApplicationId {
-                    bytecode_id: *bytecode_id,
-                    creation: context.next_message_id(),
-                };
-                self.registry
-                    .register_new_application(
-                        id,
-                        parameters.clone(),
-                        required_application_ids.clone(),
+                let next_message_id = context.next_message_id(txn_tracker.next_message_index());
+                let CreateApplicationResult {
+                    app_id,
+                    message,
+                    blobs_to_register,
+                } = self
+                    .create_application(
+                        next_message_id,
+                        bytecode_id,
+                        parameters,
+                        required_application_ids,
                     )
                     .await?;
-                // Send a message to ourself to increment the message ID.
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(context.chain_id),
-                    authenticated: false,
-                    message: SystemMessage::ApplicationCreated,
-                };
-                result.messages.push(message);
-                new_application = Some((id, initialization_argument.clone()));
+                self.record_bytecode_blobs(blobs_to_register, txn_tracker)
+                    .await?;
+                outcome.messages.push(message);
+                new_application = Some((app_id, instantiation_argument.clone()));
             }
             RequestApplication {
                 chain_id,
                 application_id,
             } => {
                 let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*chain_id),
+                    destination: Destination::Recipient(chain_id),
                     authenticated: false,
-                    message: SystemMessage::RequestApplication(*application_id),
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Simple,
+                    message: SystemMessage::RequestApplication(application_id),
                 };
-                result.messages.push(message);
+                outcome.messages.push(message);
+            }
+            PublishDataBlob { blob_hash } => {
+                self.blob_published(&BlobId::new(blob_hash, BlobType::Data))?;
+            }
+            ReadBlob { blob_id } => {
+                self.read_blob_content(blob_id).await?;
+                self.blob_used(Some(txn_tracker), blob_id).await?;
             }
         }
 
-        Ok((result, new_application))
+        txn_tracker.add_system_outcome(outcome)?;
+        Ok(new_application)
+    }
+
+    pub async fn transfer(
+        &mut self,
+        authenticated_signer: Option<Owner>,
+        authenticated_application_id: Option<UserApplicationId>,
+        source: Option<AccountOwner>,
+        recipient: Recipient,
+        amount: Amount,
+    ) -> Result<Option<RawOutgoingMessage<SystemMessage, Amount>>, SystemExecutionError> {
+        match (source, authenticated_signer, authenticated_application_id) {
+            (Some(AccountOwner::User(owner)), Some(signer), _) => ensure!(
+                signer == owner,
+                SystemExecutionError::UnauthenticatedTransferOwner
+            ),
+            (
+                Some(AccountOwner::Application(account_application)),
+                _,
+                Some(authorized_application),
+            ) => ensure!(
+                account_application == authorized_application,
+                SystemExecutionError::UnauthenticatedTransferOwner
+            ),
+            (None, Some(signer), _) => ensure!(
+                self.ownership.get().verify_owner(&signer),
+                SystemExecutionError::UnauthenticatedTransferOwner
+            ),
+            (_, _, _) => return Err(SystemExecutionError::UnauthenticatedTransferOwner),
+        }
+        ensure!(
+            amount > Amount::ZERO,
+            SystemExecutionError::IncorrectTransferAmount
+        );
+        self.debit(source.as_ref(), amount).await?;
+        match recipient {
+            Recipient::Account(account) => {
+                let message = RawOutgoingMessage {
+                    destination: Destination::Recipient(account.chain_id),
+                    authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Tracked,
+                    message: SystemMessage::Credit {
+                        amount,
+                        source,
+                        target: account.owner,
+                    },
+                };
+
+                Ok(Some(message))
+            }
+            Recipient::Burn => Ok(None),
+        }
+    }
+
+    pub async fn claim(
+        &self,
+        authenticated_signer: Option<Owner>,
+        authenticated_application_id: Option<UserApplicationId>,
+        source: AccountOwner,
+        target_id: ChainId,
+        recipient: Recipient,
+        amount: Amount,
+    ) -> Result<RawOutgoingMessage<SystemMessage, Amount>, SystemExecutionError> {
+        match source {
+            AccountOwner::User(owner) => ensure!(
+                authenticated_signer == Some(owner),
+                SystemExecutionError::UnauthenticatedClaimOwner
+            ),
+            AccountOwner::Application(owner) => ensure!(
+                authenticated_application_id == Some(owner),
+                SystemExecutionError::UnauthenticatedClaimOwner
+            ),
+        }
+        ensure!(
+            amount > Amount::ZERO,
+            SystemExecutionError::IncorrectClaimAmount
+        );
+
+        Ok(RawOutgoingMessage {
+            destination: Destination::Recipient(target_id),
+            authenticated: true,
+            grant: Amount::ZERO,
+            kind: MessageKind::Simple,
+            message: SystemMessage::Withdraw {
+                amount,
+                owner: source,
+                recipient,
+            },
+        })
+    }
+
+    /// Debits an [`Amount`] of tokens from an account's balance.
+    async fn debit(
+        &mut self,
+        account: Option<&AccountOwner>,
+        amount: Amount,
+    ) -> Result<(), SystemExecutionError> {
+        let balance = if let Some(owner) = account {
+            self.balances.get_mut(owner).await?.ok_or_else(|| {
+                SystemExecutionError::InsufficientFunding {
+                    balance: Amount::ZERO,
+                }
+            })?
+        } else {
+            self.balance.get_mut()
+        };
+
+        balance
+            .try_sub_assign(amount)
+            .map_err(|_| SystemExecutionError::InsufficientFunding { balance: *balance })?;
+
+        if let Some(owner) = account {
+            if balance.is_zero() {
+                self.balances.remove(owner)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Executes a cross-chain message that represents the recipient's side of an operation.
-    ///
-    /// * Messages should not return an error unless it is a temporary failure (e.g.
-    /// storage) or a global system failure. An error will fail the entire cross-chain
-    /// request, allowing it to be retried later.
-    ///
-    /// * If execution is impossible for a deterministic reason (e.g. insufficient
-    /// funds), messages should fail silently and be skipped (similar to a transaction in
-    /// traditional blockchains).
     pub async fn execute_message(
         &mut self,
-        context: &MessageContext,
-        message: &SystemMessage,
-    ) -> Result<RawExecutionResult<SystemMessage>, SystemExecutionError> {
-        let mut result = RawExecutionResult::default();
+        context: MessageContext,
+        message: SystemMessage,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<RawExecutionOutcome<SystemMessage, Amount>, SystemExecutionError> {
+        let mut outcome = RawExecutionOutcome::default();
         use SystemMessage::*;
         match message {
-            Credit { amount, account } if context.chain_id == account.chain_id => {
-                match &account.owner {
+            Credit {
+                amount,
+                source,
+                target,
+            } => {
+                let receiver = if context.is_bouncing { source } else { target };
+                match receiver {
                     None => {
-                        let new_balance = self.balance.get().saturating_add(*amount);
+                        let new_balance = self.balance.get().saturating_add(amount);
                         self.balance.set(new_balance);
                     }
                     Some(owner) => {
-                        let balance = self.balances.get_mut_or_default(owner).await?;
-                        *balance = balance.saturating_add(*amount);
+                        let balance = self.balances.get_mut_or_default(&owner).await?;
+                        *balance = balance.saturating_add(amount);
                     }
                 }
             }
             Withdraw {
                 amount,
-                account:
-                    Account {
-                        owner: Some(owner),
-                        chain_id,
-                    },
-                user_data: _,
+                owner,
                 recipient,
-            } if chain_id == &context.chain_id
-                && context.authenticated_signer.as_ref() == Some(owner) =>
-            {
-                let balance = self.balances.get_mut_or_default(owner).await?;
-                if balance.try_sub_assign(*amount).is_ok() {
-                    if let Recipient::Account(account) = recipient {
+            } => {
+                self.debit(Some(&owner), amount).await?;
+                match recipient {
+                    Recipient::Account(account) => {
                         let message = RawOutgoingMessage {
                             destination: Destination::Recipient(account.chain_id),
                             authenticated: false,
+                            grant: Amount::ZERO,
+                            kind: MessageKind::Tracked,
                             message: SystemMessage::Credit {
-                                amount: *amount,
-                                account: *account,
+                                amount,
+                                source: Some(owner),
+                                target: account.owner,
                             },
                         };
-                        result.messages.push(message);
+                        outcome.messages.push(message);
                     }
-                } else {
-                    tracing::info!("Withdrawal request was skipped due to lack of funds.");
+                    Recipient::Burn => (),
                 }
             }
-            SetCommittees { epoch, committees } => {
+            CreateCommittee { epoch, committee } => {
+                let chain_next_epoch = self.epoch.get().expect("chain is active").try_add_one()?;
                 ensure!(
-                    *epoch >= self.epoch.get().expect("chain is active"),
-                    SystemExecutionError::CannotRewindEpoch
+                    epoch <= chain_next_epoch,
+                    SystemExecutionError::InvalidCommitteeCreation
                 );
-                self.epoch.set(Some(*epoch));
-                self.committees.set(committees.clone());
-            }
-            Subscribe { id, subscription } if subscription.chain_id == context.chain_id => {
-                // Notify the subscriber about this block, so that it is included in the
-                // receive_log of the subscriber and correctly synchronized.
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*id),
-                    authenticated: false,
-                    message: SystemMessage::Notify { id: *id },
-                };
-                result.messages.push(message);
-                result.subscribe.push((subscription.name.clone(), *id));
-            }
-            Unsubscribe { id, subscription } if subscription.chain_id == context.chain_id => {
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(*id),
-                    authenticated: false,
-                    message: SystemMessage::Notify { id: *id },
-                };
-                result.messages.push(message);
-                result.unsubscribe.push((subscription.name.clone(), *id));
-            }
-            BytecodePublished { operation_index } => {
-                let bytecode_id = BytecodeId::new(context.message_id);
-                let bytecode_location = BytecodeLocation {
-                    certificate_hash: context.certificate_hash,
-                    operation_index: *operation_index,
-                };
-                self.registry
-                    .register_published_bytecode(bytecode_id, bytecode_location)?;
-                let locations = self.registry.bytecode_locations().await?;
-                let message = RawOutgoingMessage {
-                    destination: Destination::Subscribers(SystemChannel::PublishedBytecodes.name()),
-                    authenticated: false,
-                    message: SystemMessage::BytecodeLocations { locations },
-                };
-                result.messages.push(message);
-            }
-            BytecodeLocations { locations } => {
-                for (id, location) in locations {
-                    self.registry.register_published_bytecode(*id, *location)?;
+                if epoch == chain_next_epoch {
+                    self.committees.get_mut().insert(epoch, committee.clone());
+                    self.epoch.set(Some(epoch));
                 }
             }
-            ApplicationCreated { .. } | Notify { .. } => (),
-            OpenChain { .. } => {
-                // This special message is executed immediately when cross-chain requests are received.
+            RemoveCommittee { epoch } => {
+                self.committees.get_mut().remove(&epoch);
             }
             RegisterApplications { applications } => {
                 for application in applications {
+                    self.check_and_record_bytecode_blobs(&application.bytecode_id, txn_tracker)
+                        .await?;
                     self.registry
                         .register_application(application.clone())
                         .await?;
                 }
             }
             RequestApplication(application_id) => {
-                match self
+                let applications = self
                     .registry
                     .describe_applications_with_dependencies(
-                        vec![*application_id],
+                        vec![application_id],
                         &Default::default(),
                     )
-                    .await
-                {
-                    Err(SystemExecutionError::UnknownApplicationId(id)) => {
-                        tracing::info!(
-                            %id,
-                            "Application request was skipped: application not known."
-                        );
-                    }
-                    Err(err) => return Err(err),
-                    Ok(applications) => {
-                        let message = RawOutgoingMessage {
-                            destination: Destination::Recipient(context.message_id.chain_id),
-                            authenticated: false,
-                            message: SystemMessage::RegisterApplications { applications },
-                        };
-                        result.messages.push(message);
-                    }
-                }
+                    .await?;
+                let message = RawOutgoingMessage {
+                    destination: Destination::Recipient(context.message_id.chain_id),
+                    authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Simple,
+                    message: SystemMessage::RegisterApplications { applications },
+                };
+                outcome.messages.push(message);
             }
-            _ => {
-                tracing::error!(
-                    "Skipping unexpected received message: {message:?} with context: {context:?}"
-                );
-            }
+            // These messages are executed immediately when cross-chain requests are received.
+            Subscribe { .. } | Unsubscribe { .. } | OpenChain(_) => {}
+            // This message is only a placeholder: Its ID is part of the application ID.
+            ApplicationCreated => {}
         }
-        Ok(result)
+        Ok(outcome)
     }
 
     /// Initializes the system application state on a newly opened chain.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_chain(
+    pub fn initialize_chain(
         &mut self,
         message_id: MessageId,
-        ownership: ChainOwnership,
-        epoch: Epoch,
-        committees: BTreeMap<Epoch, Committee>,
-        admin_id: ChainId,
         timestamp: Timestamp,
+        config: OpenChainConfig,
     ) {
         // Guaranteed under BFT assumptions.
         assert!(self.description.get().is_none());
         assert!(!self.ownership.get().is_active());
         assert!(self.committees.get().is_empty());
+        let OpenChainConfig {
+            ownership,
+            admin_id,
+            epoch,
+            committees,
+            balance,
+            application_permissions,
+        } = config;
         let description = ChainDescription::Child(message_id);
         self.description.set(Some(description));
         self.epoch.set(Some(epoch));
@@ -935,17 +934,247 @@ where
             .expect("serialization failed");
         self.ownership.set(ownership);
         self.timestamp.set(timestamp);
+        self.balance.set(balance);
+        self.application_permissions.set(application_permissions);
     }
 
-    pub async fn query_application(
+    pub async fn handle_query(
         &mut self,
-        context: &QueryContext,
-        _query: &SystemQuery,
-    ) -> Result<SystemResponse, SystemExecutionError> {
+        context: QueryContext,
+        _query: SystemQuery,
+    ) -> Result<QueryOutcome<SystemResponse>, SystemExecutionError> {
         let response = SystemResponse {
             chain_id: context.chain_id,
             balance: *self.balance.get(),
         };
-        Ok(response)
+        Ok(QueryOutcome {
+            response,
+            operations: vec![],
+        })
+    }
+
+    /// Returns the messages to open a new chain, and subtracts the new chain's balance
+    /// from this chain's.
+    pub async fn open_chain(
+        &mut self,
+        config: OpenChainConfig,
+        next_message_id: MessageId,
+    ) -> Result<[RawOutgoingMessage<SystemMessage, Amount>; 2], SystemExecutionError> {
+        let child_id = ChainId::child(next_message_id);
+        ensure!(
+            self.admin_id.get().as_ref() == Some(&config.admin_id),
+            SystemExecutionError::InvalidNewChainAdminId(child_id)
+        );
+        let admin_id = config.admin_id;
+        ensure!(
+            self.committees.get() == &config.committees,
+            SystemExecutionError::InvalidCommittees
+        );
+        ensure!(
+            self.epoch.get().as_ref() == Some(&config.epoch),
+            SystemExecutionError::InvalidEpoch {
+                chain_id: child_id,
+                epoch: config.epoch,
+            }
+        );
+        self.debit(None, config.balance).await?;
+        let open_chain_message = RawOutgoingMessage {
+            destination: Destination::Recipient(child_id),
+            authenticated: false,
+            grant: Amount::ZERO,
+            kind: MessageKind::Protected,
+            message: SystemMessage::OpenChain(config),
+        };
+        let subscription = ChannelSubscription {
+            chain_id: admin_id,
+            name: SystemChannel::Admin.name(),
+        };
+        let subscribe_message = RawOutgoingMessage {
+            destination: Destination::Recipient(admin_id),
+            authenticated: false,
+            grant: Amount::ZERO,
+            kind: MessageKind::Protected,
+            message: SystemMessage::Subscribe {
+                id: child_id,
+                subscription,
+            },
+        };
+        Ok([open_chain_message, subscribe_message])
+    }
+
+    pub async fn close_chain(
+        &mut self,
+        id: ChainId,
+    ) -> Result<Vec<RawOutgoingMessage<SystemMessage, Amount>>, SystemExecutionError> {
+        let mut messages = Vec::new();
+        // Unsubscribe from all channels.
+        self.subscriptions
+            .for_each_index(|subscription| {
+                let message = RawOutgoingMessage {
+                    destination: Destination::Recipient(subscription.chain_id),
+                    authenticated: false,
+                    grant: Amount::ZERO,
+                    kind: MessageKind::Protected,
+                    message: SystemMessage::Unsubscribe { id, subscription },
+                };
+                messages.push(message);
+                Ok(())
+            })
+            .await?;
+        self.subscriptions.clear();
+        self.closed.set(true);
+        Ok(messages)
+    }
+
+    pub async fn create_application(
+        &mut self,
+        next_message_id: MessageId,
+        bytecode_id: BytecodeId,
+        parameters: Vec<u8>,
+        required_application_ids: Vec<UserApplicationId>,
+    ) -> Result<CreateApplicationResult, SystemExecutionError> {
+        let id = UserApplicationId {
+            bytecode_id,
+            creation: next_message_id,
+        };
+        let mut blobs_to_register = vec![];
+        for application in required_application_ids.iter().chain(iter::once(&id)) {
+            let (contract_bytecode_blob_id, service_bytecode_blob_id) =
+                self.check_bytecode_blobs(&application.bytecode_id).await?;
+            // We only remember to register the blobs that aren't recorded in `used_blobs`
+            // already.
+            if !self.used_blobs.contains(&contract_bytecode_blob_id).await? {
+                blobs_to_register.push(contract_bytecode_blob_id);
+            }
+            if !self.used_blobs.contains(&service_bytecode_blob_id).await? {
+                blobs_to_register.push(service_bytecode_blob_id);
+            }
+        }
+        self.registry
+            .register_new_application(id, parameters.clone(), required_application_ids.clone())
+            .await?;
+        // Send a message to ourself to increment the message ID.
+        let message = RawOutgoingMessage {
+            destination: Destination::Recipient(next_message_id.chain_id),
+            authenticated: false,
+            grant: Amount::ZERO,
+            kind: MessageKind::Protected,
+            message: SystemMessage::ApplicationCreated,
+        };
+
+        Ok(CreateApplicationResult {
+            app_id: id,
+            message,
+            blobs_to_register,
+        })
+    }
+
+    /// Records a blob that is used in this block. If this is the first use on this chain, creates
+    /// an oracle response for it.
+    pub(crate) async fn blob_used(
+        &mut self,
+        txn_tracker: Option<&mut TransactionTracker>,
+        blob_id: BlobId,
+    ) -> Result<bool, SystemExecutionError> {
+        if self.used_blobs.contains(&blob_id).await? {
+            return Ok(false); // Nothing to do.
+        }
+        self.used_blobs.insert(&blob_id)?;
+        if let Some(txn_tracker) = txn_tracker {
+            txn_tracker.replay_oracle_response(OracleResponse::Blob(blob_id))?;
+        }
+        Ok(true)
+    }
+
+    /// Records a blob that is published in this block. This does not create an oracle entry, and
+    /// the blob can be used without using an oracle in the future on this chain.
+    fn blob_published(&mut self, blob_id: &BlobId) -> Result<(), SystemExecutionError> {
+        self.used_blobs.insert(blob_id)?;
+        Ok(())
+    }
+
+    pub async fn read_blob_content(
+        &mut self,
+        blob_id: BlobId,
+    ) -> Result<BlobContent, SystemExecutionError> {
+        match self.context().extra().get_blob(blob_id).await {
+            Ok(blob) => Ok(blob.into()),
+            Err(ViewError::BlobsNotFound(_)) => {
+                Err(SystemExecutionError::BlobsNotFound(vec![blob_id]))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn assert_blob_exists(
+        &mut self,
+        blob_id: BlobId,
+    ) -> Result<(), SystemExecutionError> {
+        if self.context().extra().contains_blob(blob_id).await? {
+            Ok(())
+        } else {
+            Err(SystemExecutionError::BlobsNotFound(vec![blob_id]))
+        }
+    }
+
+    async fn check_bytecode_blobs(
+        &mut self,
+        bytecode_id: &BytecodeId,
+    ) -> Result<(BlobId, BlobId), SystemExecutionError> {
+        let contract_bytecode_blob_id =
+            BlobId::new(bytecode_id.contract_blob_hash, BlobType::ContractBytecode);
+
+        let mut missing_blobs = Vec::new();
+        if !self
+            .context()
+            .extra()
+            .contains_blob(contract_bytecode_blob_id)
+            .await?
+        {
+            missing_blobs.push(contract_bytecode_blob_id);
+        }
+
+        let service_bytecode_blob_id =
+            BlobId::new(bytecode_id.service_blob_hash, BlobType::ServiceBytecode);
+        if !self
+            .context()
+            .extra()
+            .contains_blob(service_bytecode_blob_id)
+            .await?
+        {
+            missing_blobs.push(service_bytecode_blob_id);
+        }
+
+        ensure!(
+            missing_blobs.is_empty(),
+            SystemExecutionError::BlobsNotFound(missing_blobs)
+        );
+
+        Ok((contract_bytecode_blob_id, service_bytecode_blob_id))
+    }
+
+    async fn record_bytecode_blobs(
+        &mut self,
+        blob_ids: Vec<BlobId>,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), SystemExecutionError> {
+        for blob_id in blob_ids {
+            self.blob_used(Some(txn_tracker), blob_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn check_and_record_bytecode_blobs(
+        &mut self,
+        bytecode_id: &BytecodeId,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), SystemExecutionError> {
+        let (contract_bytecode_blob_id, service_bytecode_blob_id) =
+            self.check_bytecode_blobs(bytecode_id).await?;
+        self.record_bytecode_blobs(
+            vec![contract_bytecode_blob_id, service_bytecode_blob_id],
+            txn_tracker,
+        )
+        .await
     }
 }

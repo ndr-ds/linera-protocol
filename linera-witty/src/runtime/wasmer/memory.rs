@@ -3,14 +3,16 @@
 
 //! How to access the memory of a Wasmer guest instance.
 
+use std::borrow::Cow;
+
+use wasmer::{Extern, Memory};
+
 use super::{super::traits::InstanceWithMemory, EntrypointInstance, ReentrantInstance};
 use crate::{GuestPointer, RuntimeError, RuntimeMemory};
-use std::borrow::Cow;
-use wasmer::{Extern, Memory};
 
 macro_rules! impl_memory_traits {
     ($instance:ty) => {
-        impl InstanceWithMemory for $instance {
+        impl<UserData: 'static> InstanceWithMemory for $instance {
             fn memory_from_export(&self, export: Extern) -> Result<Option<Memory>, RuntimeError> {
                 Ok(match export {
                     Extern::Memory(memory) => Some(memory),
@@ -19,7 +21,7 @@ macro_rules! impl_memory_traits {
             }
         }
 
-        impl RuntimeMemory<$instance> for Memory {
+        impl<UserData: 'static> RuntimeMemory<$instance> for Memory {
             fn read<'instance>(
                 &self,
                 instance: &'instance $instance,
@@ -50,5 +52,5 @@ macro_rules! impl_memory_traits {
     };
 }
 
-impl_memory_traits!(EntrypointInstance);
-impl_memory_traits!(ReentrantInstance<'_>);
+impl_memory_traits!(EntrypointInstance<UserData>);
+impl_memory_traits!(ReentrantInstance<'_, UserData>);

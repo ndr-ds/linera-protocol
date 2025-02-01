@@ -6,8 +6,9 @@
 //! This is analogous to what [`MaybeFlatType`] is to [`crate::primitive_types::FlatType`]. Empty
 //! slots (represented by the `()` unit type) make it easier to generate code for zero sized types.
 
-use crate::primitive_types::{JoinFlatTypes, MaybeFlatType, SimpleType};
 use either::Either;
+
+use crate::primitive_types::{JoinFlatTypes, MaybeFlatType, SimpleType};
 
 /// Marker trait to prevent [`LayoutElement`] to be implemented for other types.
 pub trait Sealed {}
@@ -59,26 +60,9 @@ where
 {
 }
 
-impl<R> LayoutElement for Either<(), R>
-where
-    R: LayoutElement,
-{
-    const ALIGNMENT: u32 = R::ALIGNMENT;
-    const IS_EMPTY: bool = R::IS_EMPTY;
-
-    type Flat = R::Flat;
-
-    fn flatten(self) -> Self::Flat {
-        match self {
-            Either::Left(()) => <R::Flat as Default>::default(),
-            Either::Right(value) => value.flatten(),
-        }
-    }
-}
-
 impl<L, R> LayoutElement for Either<L, R>
 where
-    L: SimpleType,
+    L: LayoutElement,
     R: LayoutElement,
     Either<L::Flat, R::Flat>: JoinFlatTypes,
 {

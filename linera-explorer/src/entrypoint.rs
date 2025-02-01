@@ -1,12 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::js_utils::{getf, js_to_json, setf, SER};
-
 use serde::Serialize;
 use serde_json::Value;
 use serde_wasm_bindgen::from_value;
 use wasm_bindgen::prelude::*;
+
+use super::js_utils::{getf, js_to_json, setf, SER};
+use crate::reqwest_client;
 
 /// Auxiliary recursive function for forge_arg.
 fn forge_arg_type(arg: &Value, non_null: bool) -> Option<String> {
@@ -24,17 +25,17 @@ fn forge_arg_type(arg: &Value, non_null: bool) -> Option<String> {
         }
         Some("NON_NULL") => forge_arg_type(&arg["ofType"], true),
         Some("LIST") => {
-            let args: Vec<String> = arg["_input"]
+            let args = arg["_input"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(|x| forge_arg_type(x, false))
-                .collect();
+                .collect::<Vec<_>>();
             Some(format!("[{}]", args.join(", ")))
         }
         Some("ENUM") => arg["_input"].as_str().map(|x| x.to_string()),
         Some("INPUT_OBJECT") => {
-            let args: Vec<String> = arg["inputFields"]
+            let args = arg["inputFields"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -42,7 +43,7 @@ fn forge_arg_type(arg: &Value, non_null: bool) -> Option<String> {
                     let name = x["name"].as_str().unwrap();
                     forge_arg_type(&x["type"], false).map(|arg| format!("{}: {}", name, arg))
                 })
-                .collect();
+                .collect::<Vec<_>>();
             Some(format!("{{{}}}", args.join(", ")))
         }
         _ => None,
@@ -62,7 +63,7 @@ fn forge_arg(arg: &Value) -> Option<String> {
 
 /// Forges query arguments.
 fn forge_args(args: Vec<Value>) -> String {
-    let args: Vec<String> = args.iter().filter_map(forge_arg).collect();
+    let args = args.iter().filter_map(forge_arg).collect::<Vec<_>>();
     if !args.is_empty() {
         format!("({})", args.join(","))
     } else {
@@ -85,14 +86,14 @@ fn forge_response_type(output: &Value, name: Option<&str>, root: bool) -> Option
         ),
         "NON_NULL" | "LIST" => forge_response_type(&output["ofType"], name, root),
         "OBJECT" => {
-            let fields: Vec<String> = output["fields"]
+            let fields = output["fields"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(|elt: &Value| {
                     forge_response_type(&elt["type"], elt["name"].as_str(), false)
                 })
-                .collect();
+                .collect::<Vec<_>>();
             if root {
                 Some(format!("{{ {} }}", fields.join(" ")))
             } else {
@@ -121,15 +122,15 @@ fn forge_response(output: &Value) -> String {
 pub async fn query(app: JsValue, query: JsValue, kind: String) {
     let link =
         from_value::<String>(getf(&app, "link")).expect("cannot parse application vue argument");
-    let query_json = js_to_json(&query);
-    let name = query_json["name"].as_str().unwrap();
-    let args = query_json["args"].as_array().unwrap().to_vec();
+    let fetch_json = js_to_json(&query);
+    let name = fetch_json["name"].as_str().unwrap();
+    let args = fetch_json["args"].as_array().unwrap().to_vec();
     let args = forge_args(args);
     let input = format!("{}{}", name, args);
-    let response = forge_response(&query_json["type"]);
+    let response = forge_response(&fetch_json["type"]);
     let body =
         serde_json::json!({ "query": format!("{} {{{} {}}}", kind, input, response) }).to_string();
-    let client = reqwest::Client::new();
+    let client = reqwest_client();
     match client.post(&link).body(body).send().await {
         Err(e) => setf(&app, "errors", &JsValue::from_str(&e.to_string())),
         Ok(response) => match response.text().await {

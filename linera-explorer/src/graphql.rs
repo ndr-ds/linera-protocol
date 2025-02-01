@@ -1,88 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use graphql_client::GraphQLQuery;
-use linera_base::{
-    crypto::CryptoHash,
-    data_types::{BlockHeight, RoundNumber, Timestamp},
-    identifiers::{ChainId, Destination, Owner},
-};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 use serde_json::Value;
 
-type Epoch = Value;
-type Message = Value;
-type Operation = Value;
-type Event = Value;
-type Origin = Value;
-type UserApplicationDescription = Value;
-type ApplicationId = String;
+use crate::reqwest_client;
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Notification {
-    pub chain_id: ChainId,
-    pub reason: Reason,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[allow(clippy::enum_variant_names)]
-pub enum Reason {
-    NewBlock {
-        height: BlockHeight,
-        hash: CryptoHash,
-    },
-    NewIncomingMessage {
-        origin: Origin,
-        height: BlockHeight,
-    },
-    NewRound {
-        height: BlockHeight,
-        round: RoundNumber,
-    },
-}
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "graphql/schema.graphql",
-    query_path = "graphql/blocks.graphql",
-    response_derives = "Debug, Serialize, Clone"
-)]
-pub struct Blocks;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "graphql/schema.graphql",
-    query_path = "graphql/block.graphql",
-    response_derives = "Debug, Serialize, Clone"
-)]
-pub struct Block;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "graphql/schema.graphql",
-    query_path = "graphql/chains.graphql",
-    response_derives = "Debug, Serialize"
-)]
-pub struct Chains;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "graphql/schema.graphql",
-    query_path = "graphql/applications.graphql",
-    response_derives = "Debug, Serialize, Clone"
-)]
-pub struct Applications;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "graphql/schema.graphql",
-    query_path = "graphql/notifications.graphql",
-    response_derives = "Debug, Serialize"
-)]
-pub struct Notifications;
-
-pub async fn introspection(url: &str) -> Result<Value, String> {
-    let client = reqwest::Client::new();
+pub async fn introspection(url: &str) -> Result<Value> {
+    let client = reqwest_client();
     let graphql_query =
         "query { \
            __schema { \
@@ -113,10 +38,8 @@ pub async fn introspection(url: &str) -> Result<Value, String> {
         .post(url)
         .body(format!("{{\"query\":\"{}\"}}", graphql_query))
         .send()
-        .await
-        .map_err(|e| e.to_string())?
+        .await?
         .text()
-        .await
-        .map_err(|e| e.to_string())?;
-    serde_json::from_str::<Value>(&res).map_err(|e| e.to_string())
+        .await?;
+    Ok(serde_json::from_str::<Value>(&res)?)
 }

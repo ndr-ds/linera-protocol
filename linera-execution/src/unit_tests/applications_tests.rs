@@ -1,16 +1,15 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    ApplicationRegistry, ApplicationRegistryView, BytecodeLocation, UserApplicationDescription,
-    UserApplicationId,
-};
 use linera_base::{
-    crypto::{BcsSignable, CryptoHash},
+    crypto::CryptoHash,
     data_types::BlockHeight,
     identifiers::{BytecodeId, ChainId, MessageId},
 };
-use serde::{Deserialize, Serialize};
+
+use super::{
+    ApplicationRegistry, ApplicationRegistryView, UserApplicationDescription, UserApplicationId,
+};
 
 fn message_id(index: u32) -> MessageId {
     MessageId {
@@ -20,36 +19,26 @@ fn message_id(index: u32) -> MessageId {
     }
 }
 
-fn bytecode_id(index: u32) -> BytecodeId {
-    BytecodeId::new(message_id(index))
+fn bytecode_id() -> BytecodeId {
+    BytecodeId::new(
+        CryptoHash::test_hash("contract"),
+        CryptoHash::test_hash("service"),
+    )
 }
 
 fn app_id(index: u32) -> UserApplicationId {
     UserApplicationId {
-        bytecode_id: bytecode_id(0),
+        bytecode_id: bytecode_id(),
         creation: message_id(index),
     }
 }
 
 fn app_description(index: u32, deps: Vec<u32>) -> UserApplicationDescription {
     UserApplicationDescription {
-        bytecode_id: bytecode_id(0),
-        bytecode_location: location(0),
+        bytecode_id: bytecode_id(),
         creation: message_id(index),
         parameters: vec![],
         required_application_ids: deps.into_iter().map(app_id).collect(),
-    }
-}
-
-fn location(operation_index: u32) -> BytecodeLocation {
-    #[derive(Serialize, Deserialize)]
-    struct Dummy;
-
-    impl BcsSignable for Dummy {}
-
-    BytecodeLocation {
-        certificate_hash: CryptoHash::new(&Dummy),
-        operation_index,
     }
 }
 
@@ -74,20 +63,20 @@ async fn test_topological_sort() {
         .is_err());
     view.import(registry([(3, vec![2]), (2, vec![]), (0, vec![1])]))
         .unwrap();
-    let results = view
+    let app_ids = view
         .find_dependencies(vec![app_id(1)], &Default::default())
         .await
         .unwrap();
-    assert_eq!(results, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
-    let results = view
+    assert_eq!(app_ids, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
+    let app_ids = view
         .find_dependencies(vec![app_id(0)], &Default::default())
         .await
         .unwrap();
     assert_eq!(
-        results,
+        app_ids,
         Vec::from_iter([2, 3, 1, 0].into_iter().map(app_id))
     );
-    let results = view
+    let app_ids = view
         .find_dependencies(
             vec![app_id(0), app_id(5)],
             &vec![
@@ -100,7 +89,7 @@ async fn test_topological_sort() {
         .await
         .unwrap();
     assert_eq!(
-        results,
+        app_ids,
         Vec::from_iter([2, 4, 5, 3, 1, 0].into_iter().map(app_id))
     );
 }
@@ -115,17 +104,17 @@ async fn test_topological_sort_with_loop() {
         (0, vec![1]),
     ]))
     .unwrap();
-    let results = view
+    let app_ids = view
         .find_dependencies(vec![app_id(1)], &Default::default())
         .await
         .unwrap();
-    assert_eq!(results, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
-    let results = view
+    assert_eq!(app_ids, Vec::from_iter([2, 3, 1].into_iter().map(app_id)));
+    let app_ids = view
         .find_dependencies(vec![app_id(0)], &Default::default())
         .await
         .unwrap();
     assert_eq!(
-        results,
+        app_ids,
         Vec::from_iter([2, 3, 1, 0].into_iter().map(app_id))
     );
 }

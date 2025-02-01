@@ -1,33 +1,51 @@
 [package]
 name = "linera-witty"
-version = "0.4.0"
 description = "Generation of WIT compatible host code from Rust code"
-authors = ["Linera <contact@linera.io>"]
 readme = "README.md"
-repository = "https://github.com/linera-io/linera-protocol"
-homepage = "https://linera.dev"
 documentation = "https://docs.rs/linera-witty/latest/linera_witty/"
-license = "Apache-2.0"
-edition = "2021"
+
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [features]
 default = ["macros"]
+log = ["dep:log"]
 macros = ["linera-witty-macros"]
-test = ["linera-witty-macros?/mock-instance"]
-wasmer = ["dep:wasmer", "linera-witty-macros?/wasmer", "wasmer-vm"]
-wasmtime = ["dep:wasmtime", "anyhow", "linera-witty-macros?/wasmtime"]
+test = ["linera-witty-macros?/test"]
+wasmer = ["dep:wasmer", "linera-witty-macros?/wasmer"]
+wasmtime = ["dep:wasmtime", "linera-witty-macros?/wasmtime"]
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
-either = { workspace = true }
-frunk = { workspace = true }
+anyhow.workspace = true
+either.workspace = true
+frunk.workspace = true
+genawaiter.workspace = true
 linera-witty-macros = { workspace = true, optional = true }
-thiserror = { workspace = true }
+log = { workspace = true, optional = true }
+thiserror.workspace = true
 wasmer = { workspace = true, optional = true }
-wasmer-vm = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
 
+[target.wasm32-unknown-unknown.dependencies.wasmer]
+workspace = true
+optional = true
+features = ["js-default"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.wasmer]
+workspace = true
+optional = true
+features = ["singlepass"]
+
 [dev-dependencies]
-linera-witty = { workspace = true, features = ["macros", "test"] }
-test-case = { workspace = true }
-tracing = { workspace = true }
+assert_matches.workspace = true
+insta.workspace = true
+linera-witty = { path = ".", default-features = false, features = ["macros", "test"] }
+test-case.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cfg_aliases.workspace = true

@@ -8,18 +8,18 @@ use proc_macro2::{Span, TokenStream};
 use proc_macro_error::abort;
 use quote::{quote, quote_spanned, ToTokens};
 use syn::{
-    spanned::Spanned, FnArg, GenericArgument, GenericParam, Ident, ImplItem, ImplItemMethod,
-    LitStr, PatType, Path, PathArguments, PathSegment, ReturnType, Signature, Token, Type,
-    TypePath, TypeReference,
+    spanned::Spanned, FnArg, GenericArgument, GenericParam, Ident, ImplItem, ImplItemFn, LitStr,
+    PatType, Path, PathArguments, PathSegment, ReturnType, Signature, Token, Type, TypePath,
+    TypeReference,
 };
 
 /// Pieces of information extracted from a function's definition.
 pub struct FunctionInformation<'input> {
-    function: &'input ImplItemMethod,
+    pub(crate) function: &'input ImplItemFn,
+    pub(crate) is_reentrant: bool,
+    pub(crate) call_early_return: Option<Token![?]>,
     wit_name: String,
-    is_reentrant: bool,
     parameter_bindings: TokenStream,
-    call_early_return: Option<Token![?]>,
     interface_type: TokenStream,
 }
 
@@ -28,7 +28,7 @@ impl<'input> FunctionInformation<'input> {
     /// [`FunctionInformation`] instance.
     pub fn from_item(item: &'input ImplItem, caller_type_parameter: Option<&'input Ident>) -> Self {
         match item {
-            ImplItem::Method(function) => FunctionInformation::new(function, caller_type_parameter),
+            ImplItem::Fn(function) => FunctionInformation::new(function, caller_type_parameter),
             ImplItem::Const(const_item) => abort!(
                 const_item.ident,
                 "Const items are not supported in exported types"
@@ -47,7 +47,7 @@ impl<'input> FunctionInformation<'input> {
 
     /// Parses a function definition and collects pieces of information into a
     /// [`FunctionInformation`] instance.
-    pub fn new(function: &'input ImplItemMethod, caller_type: Option<&'input Ident>) -> Self {
+    pub fn new(function: &'input ImplItemFn, caller_type: Option<&'input Ident>) -> Self {
         let wit_name = function.sig.ident.to_string().to_kebab_case();
         let is_reentrant = Self::is_reentrant(&function.sig)
             || Self::uses_caller_parameter(&function.sig, caller_type);
@@ -61,10 +61,10 @@ impl<'input> FunctionInformation<'input> {
 
         FunctionInformation {
             function,
-            wit_name,
             is_reentrant,
-            parameter_bindings,
             call_early_return: is_fallible.then(|| Token![?](Span::call_site())),
+            wit_name,
+            parameter_bindings,
             interface_type,
         }
     }
@@ -164,11 +164,13 @@ impl<'input> FunctionInformation<'input> {
     }
 
     /// Generates the code to export a host function using the Wasmer runtime.
-    #[cfg(feature = "wasmer")]
-    pub fn generate_for_wasmer(&self, namespace: &LitStr, type_name: &Ident) -> TokenStream {
-        let caller = quote! {
-            linera_witty::wasmer::FunctionEnvMut<'_, linera_witty::wasmer::InstanceSlot>
-        };
+    #[cfg(with_wasmer)]
+    pub fn generate_for_wasmer(
+        &self,
+        namespace: &LitStr,
+        type_name: &Ident,
+        caller: &Type,
+    ) -> TokenStream {
         let input_to_guest_parameters = quote! {
             linera_witty::wasmer::WasmerParameters::from_wasmer(input)
         };
@@ -188,9 +190,13 @@ impl<'input> FunctionInformation<'input> {
     }
 
     /// Generates the code to export a host function using the Wasmtime runtime.
-    #[cfg(feature = "wasmtime")]
-    pub fn generate_for_wasmtime(&self, namespace: &LitStr, type_name: &Ident) -> TokenStream {
-        let caller = quote! { linera_witty::wasmtime::Caller<'_, ()> };
+    #[cfg(with_wasmtime)]
+    pub fn generate_for_wasmtime(
+        &self,
+        namespace: &LitStr,
+        type_name: &Ident,
+        caller: &Type,
+    ) -> TokenStream {
         let input_to_guest_parameters = quote! {
             linera_witty::wasmtime::WasmtimeParameters::from_wasmtime(input)
         };
@@ -210,9 +216,13 @@ impl<'input> FunctionInformation<'input> {
     }
 
     /// Generates the code to export a host function using a mock Wasm instance for testing.
-    #[cfg(feature = "mock-instance")]
-    pub fn generate_for_mock_instance(&self, namespace: &LitStr, type_name: &Ident) -> TokenStream {
-        let caller = quote! { linera_witty::MockInstance };
+    #[cfg(with_testing)]
+    pub fn generate_for_mock_instance(
+        &self,
+        namespace: &LitStr,
+        type_name: &Ident,
+        caller: &Type,
+    ) -> TokenStream {
         let input_to_guest_parameters = quote! { input };
         let guest_results_to_output = quote! { guest_results };
         let output_results_trait = quote! { linera_witty::MockResults };
@@ -232,7 +242,7 @@ impl<'input> FunctionInformation<'input> {
         &self,
         namespace: &LitStr,
         type_name: &Ident,
-        caller: TokenStream,
+        caller: &Type,
         input_to_guest_parameters: TokenStream,
         guest_results_to_output: TokenStream,
         output_results_trait: TokenStream,
@@ -291,7 +301,7 @@ impl<'input> FunctionInformation<'input> {
 /// Returns the type inside the `Ok` variant of the `maybe_result_type`.
 ///
 /// The type is only considered if it's a [`Result`] type with `RuntimeError` as its error variant.
-fn ok_type_inside_result(maybe_result_type: &Type) -> Option<&Type> {
+pub(crate) fn ok_type_inside_result(maybe_result_type: &Type) -> Option<&Type> {
     let Type::Path(TypePath { qself: None, path }) = maybe_result_type else {
         return None;
     };

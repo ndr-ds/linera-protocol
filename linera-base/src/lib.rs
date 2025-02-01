@@ -5,11 +5,38 @@
 //! between the Linera protocol (compiled from Rust to native code) and Linera
 //! applications (compiled from Rust to Wasm).
 
+#![deny(missing_docs)]
+#![deny(clippy::large_futures)]
+
+use std::fmt;
+
+#[doc(hidden)]
+pub use async_trait::async_trait;
+
 pub mod abi;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod command;
 pub mod crypto;
 pub mod data_types;
+pub mod dyn_convert;
 mod graphql;
+pub mod hashed;
 pub mod identifiers;
+mod limited_writer;
+pub mod ownership;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod port;
+#[cfg(with_metrics)]
+pub mod prometheus_util;
+#[cfg(not(chain))]
+pub mod task;
+#[cfg(not(chain))]
+pub use task::Blocking;
+pub mod time;
+#[cfg_attr(web, path = "tracing_web.rs")]
+pub mod tracing;
+#[cfg(test)]
+mod unit_tests;
 
 pub use graphql::BcsHexParseError;
 #[doc(hidden)]
@@ -71,7 +98,7 @@ macro_rules! ensure {
 ///     "Message { bytes: 20202020202020203130202020202020..20202020343020202020202020203530 }"
 /// );
 /// ```
-pub fn hex_debug<T: AsRef<[u8]>>(bytes: &T, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+pub fn hex_debug<T: AsRef<[u8]>>(bytes: &T, f: &mut fmt::Formatter) -> fmt::Result {
     const ELIDE_AFTER: usize = 16;
     let bytes = bytes.as_ref();
     if bytes.len() <= 2 * ELIDE_AFTER {
@@ -85,4 +112,39 @@ pub fn hex_debug<T: AsRef<[u8]>>(bytes: &T, f: &mut std::fmt::Formatter) -> std:
         )?;
     }
     Ok(())
+}
+
+/// Applies `hex_debug` to a slice of byte vectors.
+///
+///  # Examples
+///
+/// ```
+/// # use linera_base::hex_vec_debug;
+/// use custom_debug_derive::Debug;
+///
+/// #[derive(Debug)]
+/// struct Messages {
+///     #[debug(with = "hex_vec_debug")]
+///     byte_vecs: Vec<Vec<u8>>,
+/// }
+///
+/// let msgs = Messages {
+///     byte_vecs: vec![vec![0x12, 0x34, 0x56, 0x78], vec![0x9A]],
+/// };
+///
+/// assert_eq!(
+///     format!("{:?}", msgs),
+///     "Messages { byte_vecs: [12345678, 9a] }"
+/// );
+/// ```
+#[allow(clippy::ptr_arg)] // This only works with custom_debug_derive if it's &Vec.
+pub fn hex_vec_debug(list: &Vec<Vec<u8>>, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "[")?;
+    for (i, bytes) in list.iter().enumerate() {
+        if i != 0 {
+            write!(f, ", ")?;
+        }
+        hex_debug(bytes, f)?;
+    }
+    write!(f, "]")
 }

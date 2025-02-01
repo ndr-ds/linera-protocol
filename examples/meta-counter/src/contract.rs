@@ -3,102 +3,102 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-mod state;
-
-use self::state::MetaCounter;
-use async_trait::async_trait;
 use linera_sdk::{
-    base::{ApplicationId, ChainId, SessionId, WithContractAbi},
-    ApplicationCallResult, CalleeContext, Contract, ExecutionResult, MessageContext,
-    OperationContext, SessionCallResult, SimpleStateStorage,
+    base::{ApplicationId, StreamName, WithContractAbi},
+    Contract, ContractRuntime, Resources,
 };
-use thiserror::Error;
+use meta_counter::{Message, MetaCounterAbi, Operation};
 
-linera_sdk::contract!(MetaCounter);
+pub struct MetaCounterContract {
+    runtime: ContractRuntime<Self>,
+}
 
-impl MetaCounter {
-    fn counter_id() -> Result<ApplicationId<counter::CounterAbi>, Error> {
-        Self::parameters()
+linera_sdk::contract!(MetaCounterContract);
+
+impl MetaCounterContract {
+    fn counter_id(&mut self) -> ApplicationId<counter::CounterAbi> {
+        self.runtime.application_parameters()
     }
 }
 
-impl WithContractAbi for MetaCounter {
-    type Abi = meta_counter::MetaCounterAbi;
+impl WithContractAbi for MetaCounterContract {
+    type Abi = MetaCounterAbi;
 }
 
-#[async_trait]
-impl Contract for MetaCounter {
-    type Error = Error;
-    type Storage = SimpleStateStorage<Self>;
+impl Contract for MetaCounterContract {
+    type Message = Message;
+    type InstantiationArgument = ();
+    type Parameters = ApplicationId<counter::CounterAbi>;
 
-    async fn initialize(
-        &mut self,
-        _context: &OperationContext,
-        _argument: (),
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        Self::counter_id()?;
-        Ok(ExecutionResult::default())
+    async fn load(runtime: ContractRuntime<Self>) -> Self {
+        MetaCounterContract { runtime }
     }
 
-    async fn execute_operation(
-        &mut self,
-        _context: &OperationContext,
-        (recipient_id, operation): (ChainId, u64),
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        log::trace!("message: {:?}", operation);
-        Ok(ExecutionResult::default().with_message(recipient_id, operation))
+    async fn instantiate(&mut self, _argument: ()) {
+        // Validate that the application parameters were configured correctly.
+        self.counter_id();
+        // Send a no-op message to ourselves. This is only for testing contracts that send messages
+        // on initialization. Since the value is 0 it does not change the counter value.
+        let this_chain = self.runtime.chain_id();
+        self.runtime.emit(
+            StreamName(b"announcements".to_vec()),
+            b"updates",
+            b"instantiated",
+        );
+        self.runtime.send_message(this_chain, Message::Increment(0));
     }
 
-    async fn execute_message(
-        &mut self,
-        _context: &MessageContext,
-        message: u64,
-    ) -> Result<ExecutionResult<Self::Message>, Self::Error> {
-        log::trace!("executing {:?} via {:?}", message, Self::counter_id()?);
-        self.call_application(true, Self::counter_id()?, &message, vec![])
-            .await?;
-        Ok(ExecutionResult::default())
+    async fn execute_operation(&mut self, operation: Operation) {
+        log::trace!("operation: {:?}", operation);
+        let Operation {
+            recipient_id,
+            authenticated,
+            is_tracked,
+            query_service,
+            fuel_grant,
+            message,
+        } = operation;
+
+        let mut message = self.runtime.prepare_message(message).with_grant(Resources {
+            fuel: fuel_grant,
+            ..Resources::default()
+        });
+        if authenticated {
+            message = message.with_authentication();
+        }
+        if is_tracked {
+            message = message.with_tracking();
+        }
+        if query_service {
+            // Make a service query: The result will be logged in the executed block.
+            let counter_id = self.counter_id();
+            let _ = self
+                .runtime
+                .query_service(counter_id, "query { value }".into());
+        }
+        message.send_to(recipient_id);
     }
 
-    async fn handle_application_call(
-        &mut self,
-        _context: &CalleeContext,
-        _call: (),
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<ApplicationCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        Err(Error::CallsNotSupported)
+    async fn execute_message(&mut self, message: Message) {
+        let is_bouncing = self
+            .runtime
+            .message_is_bouncing()
+            .expect("Message delivery status has to be available when executing a message");
+        if is_bouncing {
+            log::trace!("receiving a bouncing message {message:?}");
+            return;
+        }
+        match message {
+            Message::Fail => {
+                panic!("Message failed intentionally");
+            }
+            Message::Increment(value) => {
+                let counter_id = self.counter_id();
+                log::trace!("executing {} via {:?}", value, counter_id);
+                self.runtime.call_application(true, counter_id, &value);
+            }
+        }
     }
 
-    async fn handle_session_call(
-        &mut self,
-        _context: &CalleeContext,
-        _state: Self::SessionState,
-        _call: (),
-        _forwarded_sessions: Vec<SessionId>,
-    ) -> Result<SessionCallResult<Self::Message, Self::Response, Self::SessionState>, Self::Error>
-    {
-        Err(Error::SessionsNotSupported)
-    }
-}
-
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("MetaCounter application doesn't support any cross-chain messages")]
-    MessagesNotSupported,
-
-    #[error("MetaCounter application doesn't support any cross-application calls")]
-    CallsNotSupported,
-
-    #[error("MetaCounter application doesn't support any cross-application sessions")]
-    SessionsNotSupported,
-
-    /// Failed to deserialize BCS bytes
-    #[error("Failed to deserialize BCS bytes")]
-    BcsError(#[from] bcs::Error),
-
-    /// Failed to deserialize JSON string
-    #[error("Failed to deserialize JSON string")]
-    JsonError(#[from] serde_json::Error),
+    async fn store(self) {}
 }

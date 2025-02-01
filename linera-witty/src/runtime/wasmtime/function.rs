@@ -3,16 +3,17 @@
 
 //! Implementations of [`InstanceWithFunction`] for Wasmtime instances.
 
+use wasmtime::{AsContext, AsContextMut, Extern, TypedFunc};
+
 use super::{
     parameters::WasmtimeParameters, results::WasmtimeResults, EntrypointInstance, ReentrantInstance,
 };
 use crate::{memory_layout::FlatLayout, InstanceWithFunction, Runtime, RuntimeError};
-use wasmtime::{AsContext, AsContextMut, Extern, TypedFunc};
 
 /// Implements [`InstanceWithFunction`] for the Wasmtime [`Instance`] implementations.
 macro_rules! impl_instance_with_function {
     ($instance:ty) => {
-        impl<Parameters, Results> InstanceWithFunction<Parameters, Results> for $instance
+        impl<Parameters, Results, UserData> InstanceWithFunction<Parameters, Results> for $instance
         where
             Parameters: FlatLayout + WasmtimeParameters,
             Results: FlatLayout + WasmtimeResults,
@@ -27,7 +28,11 @@ macro_rules! impl_instance_with_function {
                 export: <Self::Runtime as Runtime>::Export,
             ) -> Result<Option<Self::Function>, RuntimeError> {
                 Ok(match export {
-                    Extern::Func(function) => Some(function.typed(self.as_context())?),
+                    Extern::Func(function) => Some(
+                        function
+                            .typed(self.as_context())
+                            .map_err(RuntimeError::Wasmtime)?,
+                    ),
                     _ => None,
                 })
             }
@@ -37,7 +42,9 @@ macro_rules! impl_instance_with_function {
                 function: &Self::Function,
                 parameters: Parameters,
             ) -> Result<Results, RuntimeError> {
-                let results = function.call(self.as_context_mut(), parameters.into_wasmtime())?;
+                let results = function
+                    .call(self.as_context_mut(), parameters.into_wasmtime())
+                    .map_err(RuntimeError::Wasmtime)?;
 
                 Ok(Results::from_wasmtime(results))
             }
@@ -45,5 +52,5 @@ macro_rules! impl_instance_with_function {
     };
 }
 
-impl_instance_with_function!(EntrypointInstance);
-impl_instance_with_function!(ReentrantInstance<'_>);
+impl_instance_with_function!(EntrypointInstance<UserData>);
+impl_instance_with_function!(ReentrantInstance<'_, UserData>);

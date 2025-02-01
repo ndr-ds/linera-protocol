@@ -5,69 +5,95 @@
 
 mod conversions_from_wit;
 mod conversions_to_wit;
-pub mod exported_futures;
-pub mod system_api;
-pub mod wit_types;
+#[cfg(not(with_testing))]
+mod runtime;
+#[cfg(with_testing)]
+mod test_runtime;
+#[doc(hidden)]
+pub mod wit;
 
-// Import the system interface.
-wit_bindgen_guest_rust::import!("contract_system_api.wit");
+#[cfg(not(with_testing))]
+pub use self::runtime::ContractRuntime;
+#[cfg(with_testing)]
+pub use self::test_runtime::MockContractRuntime;
+#[doc(hidden)]
+pub use self::wit::export_contract;
+use crate::{log::ContractLogger, util::BlockingWait};
+
+/// Inside tests, use the [`MockContractRuntime`] instead of the real [`ContractRuntime`].
+#[cfg(with_testing)]
+pub type ContractRuntime<Application> = MockContractRuntime<Application>;
 
 /// Declares an implementation of the [`Contract`][`crate::Contract`] trait, exporting it from the
-/// WASM module.
+/// Wasm module.
 ///
 /// Generates the necessary boilerplate for implementing the contract WIT interface, exporting the
-/// necessary resource types and functions so that the host can call the contract application.
+/// necessary resource types and functions so that the host can call the application contract.
 #[macro_export]
 macro_rules! contract {
-    ($application:ty) => {
-        // Export the contract interface.
-        $crate::export_contract!($application);
+    ($contract:ident) => {
+        #[doc(hidden)]
+        static mut CONTRACT: Option<$contract> = None;
+
+        /// Export the contract interface.
+        $crate::export_contract!($contract with_types_in $crate::contract::wit);
 
         /// Mark the contract type to be exported.
-        impl $crate::contract::wit_types::Contract for $application {
-            type Initialize = Initialize;
-            type ExecuteOperation = ExecuteOperation;
-            type ExecuteMessage = ExecuteMessage;
-            type HandleApplicationCall = HandleApplicationCall;
-            type HandleSessionCall = HandleSessionCall;
-        }
+        impl $crate::contract::wit::exports::linera::app::contract_entrypoints::Guest
+            for $contract
+        {
+            fn instantiate(argument: Vec<u8>) {
+                use $crate::util::BlockingWait;
+                $crate::contract::run_async_entrypoint::<$contract, _, _>(
+                    unsafe { &mut CONTRACT },
+                    move |contract| {
+                        let argument = $crate::serde_json::from_slice(&argument)
+                            .expect("Failed to deserialize instantiation argument");
 
-        $crate::instance_exported_future! {
-            contract::Initialize<$application>(
-                context: $crate::contract::wit_types::OperationContext,
-                argument: Vec<u8>,
-            ) -> PollExecutionResult
-        }
+                        contract.instantiate(argument).blocking_wait()
+                    },
+                )
+            }
 
-        $crate::instance_exported_future! {
-            contract::ExecuteOperation<$application>(
-                context: $crate::contract::wit_types::OperationContext,
-                operation: Vec<u8>,
-            ) -> PollExecutionResult
-        }
+            fn execute_operation(operation: Vec<u8>) -> Vec<u8> {
+                use $crate::util::BlockingWait;
+                $crate::contract::run_async_entrypoint::<$contract, _, _>(
+                    unsafe { &mut CONTRACT },
+                    move |contract| {
+                        let operation: <$contract as $crate::abi::ContractAbi>::Operation =
+                            $crate::bcs::from_bytes(&operation)
+                                .expect("Failed to deserialize operation");
 
-        $crate::instance_exported_future! {
-            contract::ExecuteMessage<$application>(
-                context: $crate::contract::wit_types::MessageContext,
-                message: Vec<u8>,
-            ) -> PollExecutionResult
-        }
+                        let response = contract.execute_operation(operation).blocking_wait();
 
-        $crate::instance_exported_future! {
-            contract::HandleApplicationCall<$application>(
-                context: $crate::contract::wit_types::CalleeContext,
-                argument: Vec<u8>,
-                forwarded_sessions: Vec<$crate::contract::wit_types::SessionId>,
-            ) -> PollCallApplication
-        }
+                        $crate::bcs::to_bytes(&response)
+                            .expect("Failed to serialize contract's `Response`")
+                    },
+                )
+            }
 
-        $crate::instance_exported_future! {
-            contract::HandleSessionCall<$application>(
-                context: $crate::contract::wit_types::CalleeContext,
-                session: Vec<u8>,
-                argument: Vec<u8>,
-                forwarded_sessions: Vec<$crate::contract::wit_types::SessionId>,
-            ) -> PollCallSession
+            fn execute_message(message: Vec<u8>) {
+                use $crate::util::BlockingWait;
+                $crate::contract::run_async_entrypoint::<$contract, _, _>(
+                    unsafe { &mut CONTRACT },
+                    move |contract| {
+                        let message: <$contract as $crate::Contract>::Message =
+                            $crate::bcs::from_bytes(&message)
+                                .expect("Failed to deserialize message");
+
+                        contract.execute_message(message).blocking_wait()
+                    },
+                )
+            }
+
+            fn finalize() {
+                use $crate::util::BlockingWait;
+
+                let contract = unsafe { CONTRACT.take() }
+                    .expect("Calling `store` on a `Contract` instance that wasn't loaded");
+
+                contract.store().blocking_wait();
+            }
         }
 
         /// Stub of a `main` entrypoint so that the binary doesn't fail to compile on targets other
@@ -75,4 +101,22 @@ macro_rules! contract {
         #[cfg(not(target_arch = "wasm32"))]
         fn main() {}
     };
+}
+
+/// Runs an asynchronous entrypoint in a blocking manner, by repeatedly polling the entrypoint
+/// future.
+pub fn run_async_entrypoint<Contract, Output, RawOutput>(
+    contract: &mut Option<Contract>,
+    entrypoint: impl FnOnce(&mut Contract) -> Output + Send,
+) -> RawOutput
+where
+    Contract: crate::Contract,
+    Output: Into<RawOutput> + Send + 'static,
+{
+    ContractLogger::install();
+
+    let contract =
+        contract.get_or_insert_with(|| Contract::load(ContractRuntime::new()).blocking_wait());
+
+    entrypoint(contract).into()
 }

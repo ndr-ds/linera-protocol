@@ -2,19 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use linera_base::data_types::{ArithmeticError, BlockHeight};
+#[cfg(with_testing)]
+use linera_views::context::{create_test_memory_context, MemoryContext};
 use linera_views::{
-    common::Context,
+    context::Context,
     queue_view::QueueView,
     register_view::RegisterView,
-    views::{GraphQLView, View, ViewError},
-};
-
-#[cfg(any(test, feature = "test"))]
-use {
-    async_lock::Mutex,
-    linera_views::memory::{MemoryContext, TEST_MEMORY_MAX_STREAM_QUERIES},
-    std::collections::BTreeMap,
-    std::sync::Arc,
+    views::{ClonableView, View, ViewError},
 };
 
 #[cfg(test)]
@@ -24,12 +18,15 @@ mod outbox_tests;
 /// The state of an outbox
 /// * An outbox is used to send messages to another chain.
 /// * Internally, this is implemented as a FIFO queue of (increasing) block heights.
-/// Messages are contained in blocks, together with destination information, so currently
-/// we just send the certified blocks over and let the receivers figure out what were the
-/// messages for them.
+///   Messages are contained in blocks, together with destination information, so currently
+///   we just send the certified blocks over and let the receivers figure out what were the
+///   messages for them.
 /// * When marking block heights as received, messages at lower heights are also marked (ie. dequeued).
-#[derive(Debug, View, GraphQLView)]
-pub struct OutboxStateView<C> {
+#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+pub struct OutboxStateView<C>
+where
+    C: Context + Send + Sync + 'static,
+{
     /// The minimum block height accepted in the future.
     pub next_height_to_schedule: RegisterView<C, BlockHeight>,
     /// Keep sending these certified blocks of ours until they are acknowledged by
@@ -40,7 +37,6 @@ pub struct OutboxStateView<C> {
 impl<C> OutboxStateView<C>
 where
     C: Context + Clone + Send + Sync + 'static,
-    ViewError: From<C::Error>,
 {
     /// Schedules a message at the given height if we haven't already.
     /// Returns true if a change was made.
@@ -74,17 +70,13 @@ where
     }
 }
 
-#[cfg(any(test, feature = "test"))]
+#[cfg(with_testing)]
 impl OutboxStateView<MemoryContext<()>>
 where
     MemoryContext<()>: Context + Clone + Send + Sync + 'static,
-    ViewError: From<<MemoryContext<()> as linera_views::common::Context>::Error>,
 {
     pub async fn new() -> Self {
-        let guard = Arc::new(Mutex::new(BTreeMap::new()))
-            .try_lock_arc()
-            .expect("a guard");
-        let context = MemoryContext::new(guard, TEST_MEMORY_MAX_STREAM_QUERIES, ());
+        let context = create_test_memory_context();
         Self::load(context)
             .await
             .expect("Loading from memory should work")
