@@ -5,45 +5,61 @@
 
 mod state;
 
-use self::state::Counter;
-use async_graphql::{EmptySubscription, Object, Request, Response, Schema};
-use async_trait::async_trait;
-use linera_sdk::{base::WithServiceAbi, QueryContext, Service, SimpleStateStorage};
 use std::sync::Arc;
-use thiserror::Error;
 
-linera_sdk::service!(Counter);
+use async_graphql::{EmptySubscription, Object, Request, Response, Schema};
+use linera_sdk::{base::WithServiceAbi, views::View, Service, ServiceRuntime};
 
-impl WithServiceAbi for Counter {
+use self::state::CounterState;
+
+pub struct CounterService {
+    state: CounterState,
+    runtime: Arc<ServiceRuntime<Self>>,
+}
+
+linera_sdk::service!(CounterService);
+
+impl WithServiceAbi for CounterService {
     type Abi = counter::CounterAbi;
 }
 
-#[async_trait]
-impl Service for Counter {
-    type Error = Error;
-    type Storage = SimpleStateStorage<Self>;
+impl Service for CounterService {
+    type Parameters = ();
 
-    async fn query_application(
-        self: Arc<Self>,
-        _context: &QueryContext,
-        request: Request,
-    ) -> Result<Response, Self::Error> {
+    async fn new(runtime: ServiceRuntime<Self>) -> Self {
+        let state = CounterState::load(runtime.root_view_storage_context())
+            .await
+            .expect("Failed to load state");
+        CounterService {
+            state,
+            runtime: Arc::new(runtime),
+        }
+    }
+
+    async fn handle_query(&self, request: Request) -> Response {
         let schema = Schema::build(
-            QueryRoot { value: self.value },
-            MutationRoot {},
+            QueryRoot {
+                value: *self.state.value.get(),
+            },
+            MutationRoot {
+                runtime: self.runtime.clone(),
+            },
             EmptySubscription,
         )
         .finish();
-        Ok(schema.execute(request).await)
+        schema.execute(request).await
     }
 }
 
-struct MutationRoot;
+struct MutationRoot {
+    runtime: Arc<ServiceRuntime<CounterService>>,
+}
 
 #[Object]
 impl MutationRoot {
-    async fn increment(&self, value: u64) -> Vec<u8> {
-        bcs::to_bytes(&value).unwrap()
+    async fn increment(&self, value: u64) -> [u8; 0] {
+        self.runtime.schedule_operation(&value);
+        []
     }
 }
 
@@ -58,43 +74,36 @@ impl QueryRoot {
     }
 }
 
-/// An error that can occur during the contract execution.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// Invalid query argument; could not deserialize GraphQL request.
-    #[error("Invalid query argument; could not deserialize GraphQL request")]
-    InvalidQuery(#[from] serde_json::Error),
-}
-
 #[cfg(test)]
 mod tests {
-    use super::Counter;
-    use async_graphql::{Request, Response, Value};
-    use futures::FutureExt;
-    use linera_sdk::{base::ChainId, QueryContext, Service};
-    use serde_json::json;
     use std::sync::Arc;
-    use webassembly_test::webassembly_test;
 
-    #[webassembly_test]
+    use async_graphql::{Request, Response, Value};
+    use futures::FutureExt as _;
+    use linera_sdk::{util::BlockingWait, views::View, Service, ServiceRuntime};
+    use serde_json::json;
+
+    use super::{CounterService, CounterState};
+
+    #[test]
     fn query() {
         let value = 61_098_721_u64;
-        let counter = Arc::new(Counter { value });
+        let runtime = Arc::new(ServiceRuntime::<CounterService>::new());
+        let mut state = CounterState::load(runtime.root_view_storage_context())
+            .blocking_wait()
+            .expect("Failed to read from mock key value store");
+        state.value.set(value);
+
+        let service = CounterService { state, runtime };
         let request = Request::new("{ value }");
 
-        let result = counter
-            .query_application(&dummy_query_context(), request)
+        let response = service
+            .handle_query(request)
             .now_or_never()
             .expect("Query should not await anything");
 
         let expected = Response::new(Value::from_json(json!({"value" : 61_098_721})).unwrap());
 
-        assert_eq!(result.unwrap(), expected)
-    }
-
-    fn dummy_query_context() -> QueryContext {
-        QueryContext {
-            chain_id: ChainId([0; 4].into()),
-        }
+        assert_eq!(response, expected)
     }
 }

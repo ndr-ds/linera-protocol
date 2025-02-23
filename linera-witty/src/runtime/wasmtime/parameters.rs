@@ -3,9 +3,10 @@
 
 //! Representation of Wasmtime function parameter types.
 
-use crate::{primitive_types::FlatType, Layout};
-use frunk::{hlist, hlist_pat, HCons, HList};
+use frunk::{hlist, hlist_pat, HList};
 use wasmtime::{WasmParams, WasmTy};
+
+use crate::{primitive_types::FlatType, Layout};
 
 /// Conversions between flat layouts and Wasmtime parameter types.
 pub trait WasmtimeParameters {
@@ -66,53 +67,11 @@ repeat_macro!(parameters =>
     m: M,
     n: N,
     o: O,
-    p: P
+    p: P,
+    q: Q
 );
 
-impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, Rest> WasmtimeParameters
-    for HCons<
-        A,
-        HCons<
-            B,
-            HCons<
-                C,
-                HCons<
-                    D,
-                    HCons<
-                        E,
-                        HCons<
-                            F,
-                            HCons<
-                                G,
-                                HCons<
-                                    H,
-                                    HCons<
-                                        I,
-                                        HCons<
-                                            J,
-                                            HCons<
-                                                K,
-                                                HCons<
-                                                    L,
-                                                    HCons<
-                                                        M,
-                                                        HCons<
-                                                            N,
-                                                            HCons<O, HCons<P, HCons<Q, Rest>>>,
-                                                        >,
-                                                    >,
-                                                >,
-                                            >,
-                                        >,
-                                    >,
-                                >,
-                            >,
-                        >,
-                    >,
-                >,
-            >,
-        >,
-    >
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, Rest> WasmtimeParameters for HList![A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, ...Rest]
 where
     A: FlatType,
     B: FlatType,
@@ -131,6 +90,7 @@ where
     O: FlatType,
     P: FlatType,
     Q: FlatType,
+    R: FlatType,
     Rest: Layout,
 {
     type Parameters = (i32,);

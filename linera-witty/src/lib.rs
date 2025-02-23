@@ -19,14 +19,23 @@ mod imported_function_interface;
 mod memory_layout;
 mod primitive_types;
 mod runtime;
+#[cfg(with_testing)]
+pub mod test;
 mod type_traits;
 mod util;
+pub mod wit_generation;
 
-#[cfg(feature = "wasmer")]
+pub use frunk::{hlist, hlist::HList, hlist_pat, HCons, HList, HNil};
+#[cfg(with_wit_export)]
+pub use linera_witty_macros::wit_export;
+#[cfg(with_macros)]
+pub use linera_witty_macros::{wit_import, WitLoad, WitStore, WitType};
+
+#[cfg(with_wasmer)]
 pub use self::runtime::wasmer;
-#[cfg(feature = "wasmtime")]
+#[cfg(with_wasmtime)]
 pub use self::runtime::wasmtime;
-#[cfg(any(test, feature = "test"))]
+#[cfg(with_testing)]
 pub use self::runtime::{MockExportedFunction, MockInstance, MockResults, MockRuntime};
 pub use self::{
     exported_function_interface::{ExportFunction, ExportTo, ExportedFunctionInterface},
@@ -36,14 +45,6 @@ pub use self::{
         GuestPointer, Instance, InstanceWithFunction, InstanceWithMemory, Memory, Runtime,
         RuntimeError, RuntimeMemory,
     },
-    type_traits::{WitLoad, WitStore, WitType},
+    type_traits::{RegisterWitTypes, WitLoad, WitStore, WitType},
     util::{Merge, Split},
 };
-pub use frunk::{hlist, hlist::HList, hlist_pat, HCons, HList, HNil};
-#[cfg(all(
-    feature = "macros",
-    any(feature = "test", feature = "wasmer", feature = "wasmtime")
-))]
-pub use linera_witty_macros::wit_export;
-#[cfg(feature = "macros")]
-pub use linera_witty_macros::{wit_import, WitLoad, WitStore, WitType};

@@ -5,8 +5,9 @@
 
 #![allow(clippy::let_unit_value)]
 
+use wasmtime::{Caller, Linker, WasmRet, WasmTy};
+
 use crate::{primitive_types::MaybeFlatType, ExportFunction, RuntimeError};
-use wasmtime::{Caller, Linker, Trap, WasmRet, WasmTy};
 
 /// Implements [`ExportFunction`] for Wasmtime's [`Linker`] using the supported function
 /// signatures.
@@ -35,12 +36,12 @@ macro_rules! export_function {
                     move |
                         caller: Caller<'_, Data>,
                         $( $names: $types ),*
-                    | -> Result<FlatResult, Trap> {
-                        let response = handler(caller, ($( $names, )*))
-                            .map_err(|error| Trap::new(error.to_string()))?;
+                    | -> anyhow::Result<FlatResult> {
+                        let response = handler(caller, ($( $names, )*))?;
                         Ok(response)
                     },
-                )?;
+                )
+                .map_err(RuntimeError::Wasmtime)?;
                 Ok(())
             }
         }
@@ -64,4 +65,5 @@ repeat_macro!(export_function =>
     n: N,
     o: O,
     p: P,
+    q: Q,
 );

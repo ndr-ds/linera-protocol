@@ -1,26 +1,44 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implementations of Wasm instance related traits to mutable borrows of instances.
+//! Implementations of Wasm instance-related traits for mutable borrows of instances.
 //!
 //! This allows using the same traits without having to move the type implementation around, for
 //! example as parameters in reentrant functions.
+
+use std::borrow::Cow;
 
 use super::{
     traits::{CabiFreeAlias, CabiReallocAlias},
     Instance, InstanceWithFunction, InstanceWithMemory, Runtime, RuntimeError, RuntimeMemory,
 };
 use crate::{memory_layout::FlatLayout, GuestPointer};
-use std::borrow::Cow;
 
 impl<I> Instance for &mut I
 where
     I: Instance,
 {
     type Runtime = I::Runtime;
+    type UserData = I::UserData;
+    type UserDataReference<'a> = I::UserDataReference<'a>
+    where
+        Self::UserData: 'a,
+        Self: 'a;
+    type UserDataMutReference<'a> = I::UserDataMutReference<'a>
+    where
+        Self::UserData: 'a,
+        Self: 'a;
 
     fn load_export(&mut self, name: &str) -> Option<<Self::Runtime as Runtime>::Export> {
         I::load_export(*self, name)
+    }
+
+    fn user_data(&self) -> Self::UserDataReference<'_> {
+        I::user_data(*self)
+    }
+
+    fn user_data_mut(&mut self) -> Self::UserDataMutReference<'_> {
+        I::user_data_mut(*self)
     }
 }
 

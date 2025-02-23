@@ -3,17 +3,29 @@
 
 //! Implementations of the custom traits for the [`PhantomData`] type.
 
+use std::{borrow::Cow, marker::PhantomData};
+
+use frunk::{hlist, HList};
+
 use crate::{
     GuestPointer, InstanceWithMemory, Layout, Memory, Runtime, RuntimeError, RuntimeMemory,
     WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, HList};
-use std::marker::PhantomData;
 
 impl<T> WitType for PhantomData<T> {
     const SIZE: u32 = 0;
 
     type Layout = HList![];
+    type Dependencies = HList![];
+
+    fn wit_type_name() -> Cow<'static, str> {
+        "unit".into()
+    }
+
+    fn wit_type_declaration() -> Cow<'static, str> {
+        // The `unit` type used doesn't need to be declared
+        "".into()
+    }
 }
 
 impl<T> WitLoad for PhantomData<T> {

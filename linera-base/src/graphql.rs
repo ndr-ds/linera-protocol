@@ -18,9 +18,10 @@ macro_rules! doc_scalar {
 
 /// An error trying to parse the hex-digits of a BCS-encoded value.
 #[derive(thiserror::Error, Debug)]
+#[allow(missing_docs)]
 pub enum BcsHexParseError {
-    #[error("Invalid BCS: {0}")]
-    Bcs(#[from] bcs::Error),
+    #[error(transparent)]
+    BcsError(#[from] bcs::Error),
     #[error("Invalid hexadecimal: {0}")]
     Hex(#[from] hex::FromHexError),
 }
@@ -95,7 +96,6 @@ macro_rules! bcs_scalar {
             }
         }
 
-        #[$crate::async_graphql::async_trait::async_trait]
         impl $crate::async_graphql::OutputType for $ty {
             fn type_name() -> ::std::borrow::Cow<'static, ::std::primitive::str> {
                 ::std::borrow::Cow::Borrowed(::std::stringify!($ty))

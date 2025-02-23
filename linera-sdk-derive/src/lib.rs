@@ -5,21 +5,29 @@
 
 mod utils;
 
-use crate::utils::{concat, snakify};
 use proc_macro::TokenStream;
-use proc_macro2::Ident;
+use proc_macro2::{Ident, Span};
 use syn::{
     parse_macro_input, Fields, ItemEnum,
     __private::{quote::quote, TokenStream2},
 };
 
+use crate::utils::{concat, snakify};
+
 #[proc_macro_derive(GraphQLMutationRoot)]
 pub fn derive_mutation_root(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemEnum);
-    generate_mutation_root_code(input).into()
+    generate_mutation_root_code(input, "linera_sdk").into()
 }
 
-fn generate_mutation_root_code(input: ItemEnum) -> TokenStream2 {
+#[proc_macro_derive(GraphQLMutationRootInCrate)]
+pub fn derive_mutation_root_in_crate(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ItemEnum);
+    generate_mutation_root_code(input, "crate").into()
+}
+
+fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream2 {
+    let crate_root = Ident::new(crate_root, Span::call_site());
     let enum_name = input.ident;
     let mutation_root_name = concat(&enum_name, "MutationRoot");
     let mut methods = vec![];
@@ -38,8 +46,14 @@ fn generate_mutation_root_code(input: ItemEnum) -> TokenStream2 {
                     field_names.push(name);
                 }
                 methods.push(quote! {
-                    async fn #function_name(&self, #(#fields,)*) -> Vec<u8> {
-                        bcs::to_bytes(&#enum_name::#variant_name { #(#field_names,)* }).unwrap()
+                    async fn #function_name(&self, #(#fields,)*) -> [u8; 0] {
+                        let operation = #enum_name::#variant_name {
+                            #(#field_names,)*
+                        };
+
+                        self.runtime.schedule_operation(&operation);
+
+                        []
                     }
                 });
             }
@@ -53,15 +67,25 @@ fn generate_mutation_root_code(input: ItemEnum) -> TokenStream2 {
                     field_names.push(name);
                 }
                 methods.push(quote! {
-                    async fn #function_name(&self, #(#fields,)*) -> Vec<u8> {
-                        bcs::to_bytes(&#enum_name::#variant_name ( #(#field_names,)* )).unwrap()
+                    async fn #function_name(&self, #(#fields,)*) -> [u8; 0] {
+                        let operation = #enum_name::#variant_name(
+                            #(#field_names,)*
+                        );
+
+                        self.runtime.schedule_operation(&operation);
+
+                        []
                     }
                 });
             }
             Fields::Unit => {
                 methods.push(quote! {
-                    async fn #function_name(&self) -> Vec<u8> {
-                        bcs::to_bytes(&#enum_name::#variant_name).unwrap()
+                    async fn #function_name(&self) -> [u8; 0] {
+                        let operation = #enum_name::#variant_name;
+
+                        self.runtime.schedule_operation(&operation);
+
+                        []
                     }
                 });
             }
@@ -69,22 +93,35 @@ fn generate_mutation_root_code(input: ItemEnum) -> TokenStream2 {
     }
 
     quote! {
-        pub struct #mutation_root_name;
-
-        #[async_graphql::Object]
-        impl #mutation_root_name {
-            #
-
-            (#methods)
-
-            *
+        /// Mutation root
+        pub struct #mutation_root_name<Application>
+        where
+            Application: #crate_root::Service,
+            #crate_root::ServiceRuntime<Application>: Send + Sync,
+        {
+            runtime: ::std::sync::Arc<#crate_root::ServiceRuntime<Application>>,
         }
 
-        impl linera_sdk::graphql::GraphQLMutationRoot for #enum_name {
-            type MutationRoot = #mutation_root_name;
+        #[async_graphql::Object]
+        impl<Application> #mutation_root_name<Application>
+        where
+            Application: #crate_root::Service,
+            #crate_root::ServiceRuntime<Application>: Send + Sync,
+        {
+            #(#methods)*
+        }
 
-            fn mutation_root() -> Self::MutationRoot {
-                #mutation_root_name
+        impl<Application> #crate_root::graphql::GraphQLMutationRoot<Application> for #enum_name
+        where
+            Application: #crate_root::Service,
+            #crate_root::ServiceRuntime<Application>: Send + Sync,
+        {
+            type MutationRoot = #mutation_root_name<Application>;
+
+            fn mutation_root(
+                runtime: ::std::sync::Arc<#crate_root::ServiceRuntime<Application>>,
+            ) -> Self::MutationRoot {
+                #mutation_root_name { runtime }
             }
         }
     }
@@ -92,8 +129,9 @@ fn generate_mutation_root_code(input: ItemEnum) -> TokenStream2 {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::generate_mutation_root_code;
     use syn::{parse_quote, ItemEnum, __private::quote::quote};
+
+    use crate::generate_mutation_root_code;
 
     fn assert_eq_no_whitespace(mut actual: String, mut expected: String) {
         // Intentionally left here for debugging purposes
@@ -118,29 +156,55 @@ pub mod tests {
             }
         };
 
-        let output = generate_mutation_root_code(operation);
+        let output = generate_mutation_root_code(operation, "linera_sdk");
 
         let expected = quote! {
-            pub struct SomeOperationMutationRoot;
+            /// Mutation root
+            pub struct SomeOperationMutationRoot<Application>
+            where
+                Application: linera_sdk::Service,
+                linera_sdk::ServiceRuntime<Application>: Send + Sync,
+            {
+                runtime: ::std::sync::Arc<linera_sdk::ServiceRuntime<Application>>,
+            }
 
             #[async_graphql::Object]
-            impl SomeOperationMutationRoot {
-                async fn tuple_variant(&self, field0: String,) -> Vec<u8> {
-                    bcs::to_bytes(&SomeOperation::TupleVariant(field0,)).unwrap()
+            impl<Application> SomeOperationMutationRoot<Application>
+            where
+                Application: linera_sdk::Service,
+                linera_sdk::ServiceRuntime<Application>: Send + Sync,
+            {
+                async fn tuple_variant(&self, field0: String,) -> [u8; 0] {
+                    let operation = SomeOperation::TupleVariant(field0,);
+                    self.runtime.schedule_operation(&operation);
+                    []
                 }
-                async fn struct_variant(&self, a: u32, b: u64,) -> Vec<u8> {
-                    bcs::to_bytes(&SomeOperation::StructVariant { a, b, }).unwrap()
+
+                async fn struct_variant(&self, a: u32, b: u64,) -> [u8; 0] {
+                    let operation = SomeOperation::StructVariant { a, b, };
+                    self.runtime.schedule_operation(&operation);
+                    []
                 }
-                async fn empty_variant(&self) -> Vec<u8> {
-                    bcs::to_bytes(&SomeOperation::EmptyVariant).unwrap()
+
+                async fn empty_variant(&self) -> [u8; 0] {
+                    let operation = SomeOperation::EmptyVariant;
+                    self.runtime.schedule_operation(&operation);
+                    []
                 }
             }
 
-            impl linera_sdk::graphql::GraphQLMutationRoot for SomeOperation {
-                type MutationRoot = SomeOperationMutationRoot;
+            impl<Application> linera_sdk::graphql::GraphQLMutationRoot<Application>
+                for SomeOperation
+            where
+                Application: linera_sdk::Service,
+                linera_sdk::ServiceRuntime<Application>: Send + Sync,
+            {
+                type MutationRoot = SomeOperationMutationRoot<Application>;
 
-                fn mutation_root() -> Self::MutationRoot {
-                    SomeOperationMutationRoot
+                fn mutation_root(
+                    runtime: ::std::sync::Arc<linera_sdk::ServiceRuntime<Application>>,
+                ) -> Self::MutationRoot {
+                    SomeOperationMutationRoot { runtime }
                 }
             }
         };

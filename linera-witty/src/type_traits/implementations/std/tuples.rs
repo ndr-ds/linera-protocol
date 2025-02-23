@@ -3,16 +3,19 @@
 
 //! Implementations of the custom traits for the tuple types.
 
+use std::borrow::Cow;
+
+use frunk::{hlist, hlist_pat, HList};
+
 use crate::{
     GuestPointer, InstanceWithMemory, Layout, Memory, Runtime, RuntimeError, RuntimeMemory,
     WitLoad, WitStore, WitType,
 };
-use frunk::{hlist, hlist_pat, HList};
 
 /// Implement [`WitType`], [`WitLoad`] and [`WitStore`].
 ///
 /// When implementing [`WitStore`] for tuples, it's necessary to deconstruct the tuple and rebuild
-/// it as an heterogeneous list. However, because the methods receive `&self`, the deconstruction
+/// it as a heterogeneous list. However, because the methods receive `&self`, the deconstruction
 /// leads to references to the elements. Therefore an extra constraint is necessary, which is that
 /// the reference also implements [`WitStore`] and that the layout is the same as the referenced
 /// type.
@@ -48,6 +51,20 @@ macro_rules! impl_wit_traits_with_borrow_store_clause {
             const SIZE: u32 = <HList![$( $types ),*] as WitType>::SIZE;
 
             type Layout = <HList![$( $types ),*] as WitType>::Layout;
+            type Dependencies = HList![$( $types ),*];
+
+            fn wit_type_name() -> Cow<'static, str> {
+                let elements: &[Cow<'static, str>] = &[
+                    $( $types::wit_type_name(), )*
+                ];
+
+                format!("tuple<{}>", elements.join(", ")).into()
+            }
+
+            fn wit_type_declaration() -> Cow<'static, str> {
+                // The native `tuple` type doesn't need to be declared
+                "".into()
+            }
         }
 
         impl<$( $types ),*> WitLoad for ($( $types, )*)

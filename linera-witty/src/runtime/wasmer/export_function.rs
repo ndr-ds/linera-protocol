@@ -5,23 +5,26 @@
 
 #![allow(clippy::let_unit_value)]
 
-use super::{InstanceBuilder, InstanceSlot};
-use crate::{primitive_types::MaybeFlatType, ExportFunction, RuntimeError};
 use std::error::Error;
+
 use wasmer::{FromToNativeWasmType, Function, FunctionEnvMut, WasmTypeList};
+
+use super::{Environment, InstanceBuilder};
+use crate::{primitive_types::MaybeFlatType, ExportFunction, RuntimeError};
 
 /// Implements [`ExportFunction`] for [`InstanceBuilder`] using the supported function signatures.
 macro_rules! export_function {
     ($( $names:ident: $types:ident ),*) => {
-        impl<Handler, HandlerError, $( $types, )* FlatResult>
-            ExportFunction<Handler, ($( $types, )*), FlatResult> for InstanceBuilder
+        impl<Handler, HandlerError, $( $types, )* FlatResult, UserData>
+            ExportFunction<Handler, ($( $types, )*), FlatResult> for InstanceBuilder<UserData>
         where
             $( $types: FromToNativeWasmType, )*
             FlatResult: MaybeFlatType + WasmTypeList,
+            UserData: 'static,
             HandlerError: Error + Send + Sync + 'static,
             Handler:
                 Fn(
-                    FunctionEnvMut<'_, InstanceSlot>,
+                    FunctionEnvMut<'_, Environment<UserData>>,
                     ($( $types, )*),
                 ) -> Result<FlatResult, HandlerError>
                 + Send
@@ -40,7 +43,7 @@ macro_rules! export_function {
                     self,
                     &environment,
                     move |
-                        environment: FunctionEnvMut<'_, InstanceSlot>,
+                        environment: FunctionEnvMut<'_, Environment<UserData>>,
                         $( $names: $types ),*
                     | -> Result<FlatResult, wasmer::RuntimeError> {
                         handler(environment, ($( $names, )*))
@@ -80,4 +83,5 @@ repeat_macro!(export_function =>
     n: N,
     o: O,
     p: P,
+    q: Q,
 );

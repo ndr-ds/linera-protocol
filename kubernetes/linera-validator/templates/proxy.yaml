@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    cloud.google.com/app-protocols: '{"linera-port":"HTTP2"}'
+    cloud.google.com/backend-config: '{"default": "proxy-backend-config"}'
+  name: proxy
+  labels:
+    app: proxy
+spec:
+  ports:
+    - port: {{ .Values.proxyPort }}
+      name: linera-port
+      targetPort: {{ .Values.proxyPort }}
+    - port: {{ .Values.metricsPort }}
+      name: metrics
+  selector:
+    app: proxy
+  type: NodePort
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-internal
+  labels:
+    app: proxy-internal
+spec:
+  ports:
+    - port: 20100
+      name: linera-port-int
+      targetPort: 20100
+  selector:
+    app: proxy
+  type: NodePort
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+spec:
+  selector:
+    matchLabels:
+      app: proxy
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: proxy
+    spec:
+      terminationGracePeriodSeconds: 10
+      initContainers:
+        - name: linera-proxy-initializer
+          image: {{ .Values.lineraImage }}
+          imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
+          command: ["./proxy-init.sh"]
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel }}
+            - name: RUST_BACKTRACE
+              value: "1"
+      containers:
+        - name: linera-proxy
+          imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
+          image: {{ .Values.lineraImage }}
+          ports:
+            - containerPort: {{ .Values.proxyPort }}
+              name: linera-port
+            - containerPort: 20100
+              name: linera-port-int
+          command:
+            [
+              "./linera-proxy",
+              "--storage",
+              "scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042",
+              "--genesis",
+              "/config/genesis.json",
+            ]
+          args: ["/config/server.json"]
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel }}
+          volumeMounts:
+            - name: config
+              mountPath: "/config"
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: validator-config
+            items:
+              - key: serverConfig
+                path: server.json
+              - key: genesisConfig
+                path: genesis.json

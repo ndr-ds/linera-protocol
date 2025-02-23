@@ -3,9 +3,10 @@
 
 //! Representation of Wasmer function parameter types.
 
-use crate::{memory_layout::FlatLayout, primitive_types::FlatType};
 use frunk::{hlist, hlist_pat, HList};
 use wasmer::FromToNativeWasmType;
+
+use crate::{memory_layout::FlatLayout, primitive_types::FlatType};
 
 /// Conversions between flat layouts and Wasmer parameter types.
 pub trait WasmerParameters: FlatLayout {
@@ -42,7 +43,6 @@ where
     type ImportParameters = Parameter;
     type ExportParameters = (Parameter,);
 
-    #[allow(clippy::unused_unit)]
     fn into_wasmer(self) -> Self::ImportParameters {
         let hlist_pat![parameter] = self;
 
@@ -102,5 +102,6 @@ repeat_macro!(parameters =>
     m: M,
     n: N,
     o: O,
-    p: P
+    p: P,
+    q: Q
 );

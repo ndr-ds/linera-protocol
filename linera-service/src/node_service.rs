@@ -1,49 +1,52 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chain_listener::{ChainListener, ChainListenerConfig, ClientContext};
+use std::{borrow::Cow, iter, net::SocketAddr, num::NonZeroU16, sync::Arc};
+
 use async_graphql::{
     futures_util::Stream,
-    http::GraphiQLSource,
     parser::types::{DocumentOperations, ExecutableDocument, OperationType},
-    Error, MergedObject, Object, Request, ScalarType, Schema, ServerError, SimpleObject,
+    resolver_utils::ContainerType,
+    Error, MergedObject, OutputType, Request, ScalarType, Schema, ServerError, SimpleObject,
     Subscription,
 };
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
-use axum::{
-    extract::Path,
-    http::{StatusCode, Uri},
-    response,
-    response::IntoResponse,
-    Extension, Router, Server,
-};
-use futures::lock::{Mutex, MutexGuard, OwnedMutexGuard};
+use axum::{extract::Path, http::StatusCode, response, response::IntoResponse, Extension, Router};
+use futures::{lock::Mutex, Future};
 use linera_base::{
-    crypto::{CryptoError, CryptoHash, PublicKey},
-    data_types::Amount,
-    identifiers::{ApplicationId, BytecodeId, ChainId, Owner},
+    crypto::{CryptoError, CryptoHash},
+    data_types::{Amount, ApplicationPermissions, Bytecode, TimeDelta, UserApplicationDescription},
+    ensure,
+    hashed::Hashed,
+    identifiers::{ApplicationId, BytecodeId, ChainId, Owner, UserApplicationId},
+    ownership::{ChainOwnership, TimeoutConfig},
     BcsHexParseError,
 };
-use linera_chain::{data_types::HashedValue, ChainStateView};
+use linera_chain::{
+    types::{ConfirmedBlock, GenericCertificate},
+    ChainStateView,
+};
+use linera_client::chain_listener::{ChainListener, ChainListenerConfig, ClientContext};
 use linera_core::{
     client::{ChainClient, ChainClientError},
-    node::ValidatorNodeProvider,
+    data_types::ClientOutcome,
     worker::Notification,
 };
 use linera_execution::{
     committee::{Committee, Epoch},
-    system::{AdminOperation, Recipient, SystemChannel, UserData},
-    Bytecode, ChainOwnership, Operation, Query, Response, SystemOperation,
-    UserApplicationDescription, UserApplicationId,
+    system::{AdminOperation, Recipient, SystemChannel},
+    Operation, Query, QueryOutcome, QueryResponse, SystemOperation,
 };
-use linera_storage::Store;
-use linera_views::views::ViewError;
+use linera_sdk::base::BlobContent;
+use linera_storage::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeMap, net::SocketAddr, num::NonZeroU16, sync::Arc};
 use thiserror::Error as ThisError;
+use tokio::sync::OwnedRwLockReadGuard;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument, trace};
+
+use crate::util;
 
 #[derive(SimpleObject, Serialize, Deserialize, Clone)]
 pub struct Chains {
@@ -51,62 +54,21 @@ pub struct Chains {
     pub default: Option<ChainId>,
 }
 
-pub type ClientMapInner<P, S> = BTreeMap<ChainId, Arc<Mutex<ChainClient<P, S>>>>;
-pub(crate) struct ChainClients<P, S>(Arc<Mutex<ClientMapInner<P, S>>>);
-
-impl<P, S> Clone for ChainClients<P, S> {
-    fn clone(&self) -> Self {
-        ChainClients(self.0.clone())
-    }
-}
-
-impl<P, S> Default for ChainClients<P, S> {
-    fn default() -> Self {
-        Self(Arc::new(Mutex::new(BTreeMap::new())))
-    }
-}
-
-impl<P, S> ChainClients<P, S> {
-    async fn client(&self, chain_id: &ChainId) -> Option<Arc<Mutex<ChainClient<P, S>>>> {
-        Some(self.0.lock().await.get(chain_id)?.clone())
-    }
-
-    pub(crate) async fn client_lock(
-        &self,
-        chain_id: &ChainId,
-    ) -> Option<OwnedMutexGuard<ChainClient<P, S>>> {
-        Some(self.client(chain_id).await?.lock_owned().await)
-    }
-
-    pub(crate) async fn try_client_lock(
-        &self,
-        chain_id: &ChainId,
-    ) -> Result<OwnedMutexGuard<ChainClient<P, S>>, Error> {
-        self.client_lock(chain_id)
-            .await
-            .ok_or_else(|| Error::new("Unknown chain ID"))
-    }
-
-    pub(crate) async fn map_lock(&self) -> MutexGuard<ClientMapInner<P, S>> {
-        self.0.lock().await
-    }
-}
-
 /// Our root GraphQL query type.
-pub struct QueryRoot<P, S> {
-    clients: ChainClients<P, S>,
+pub struct QueryRoot<C> {
+    context: Arc<Mutex<C>>,
     port: NonZeroU16,
     default_chain: Option<ChainId>,
 }
 
 /// Our root GraphQL subscription type.
-pub struct SubscriptionRoot<P, S> {
-    clients: ChainClients<P, S>,
+pub struct SubscriptionRoot<C> {
+    context: Arc<Mutex<C>>,
 }
 
 /// Our root GraphQL mutation type.
-pub struct MutationRoot<P, S> {
-    clients: ChainClients<P, S>,
+pub struct MutationRoot<C> {
+    context: Arc<Mutex<C>>,
 }
 
 #[derive(Debug, ThisError)]
@@ -115,28 +77,28 @@ enum NodeServiceError {
     ChainClientError(#[from] ChainClientError),
     #[error(transparent)]
     BcsHexError(#[from] BcsHexParseError),
-    #[error("could not decode query string")]
+    #[error("could not decode query string: {0}")]
     QueryStringError(#[from] hex::FromHexError),
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
     #[error(transparent)]
     JsonError(#[from] serde_json::Error),
-    #[error("missing graphql operation")]
+    #[error("missing GraphQL operation")]
     MissingOperation,
     #[error("unsupported query type: subscription")]
     UnsupportedQueryType,
-    #[error("graphql operations of different types submitted")]
+    #[error("GraphQL operations of different types submitted")]
     HeterogeneousOperations,
-    #[error("failed to parse graphql query: {error}")]
+    #[error("failed to parse GraphQL query: {error}")]
     GraphQLParseError { error: String },
-    #[error("malformed application response")]
-    MalformedApplicationResponse,
-    #[error("application service error")]
+    #[error("application service error: {errors:?}")]
     ApplicationServiceError { errors: Vec<String> },
-    #[error("chain ID not found")]
-    UnknownChainId,
-    #[error("malformed chain ID")]
+    #[error("chain ID not found: {chain_id}")]
+    UnknownChainId { chain_id: String },
+    #[error("malformed chain ID: {0}")]
     InvalidChainId(CryptoError),
+    #[error("unexpected application operations added during non-mutation query")]
+    UnexpectedOperationsFromQuery,
 }
 
 impl From<ServerError> for NodeServiceError {
@@ -161,7 +123,7 @@ impl IntoResponse for NodeServiceError {
             NodeServiceError::JsonError(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, vec![e.to_string()])
             }
-            NodeServiceError::MalformedApplicationResponse => {
+            NodeServiceError::UnexpectedOperationsFromQuery => {
                 (StatusCode::INTERNAL_SERVER_ERROR, vec![self.to_string()])
             }
             NodeServiceError::MissingOperation
@@ -173,9 +135,10 @@ impl IntoResponse for NodeServiceError {
             NodeServiceError::ApplicationServiceError { errors } => {
                 (StatusCode::BAD_REQUEST, errors)
             }
-            NodeServiceError::UnknownChainId => {
-                (StatusCode::NOT_FOUND, vec!["unknown chain ID".to_string()])
-            }
+            NodeServiceError::UnknownChainId { chain_id } => (
+                StatusCode::NOT_FOUND,
+                vec![format!("unknown chain ID: {}", chain_id)],
+            ),
             NodeServiceError::InvalidChainId(_) => (
                 StatusCode::BAD_REQUEST,
                 vec!["invalid chain ID".to_string()],
@@ -187,56 +150,115 @@ impl IntoResponse for NodeServiceError {
 }
 
 #[Subscription]
-impl<P, S> SubscriptionRoot<P, S>
+impl<C> SubscriptionRoot<C>
 where
-    P: ValidatorNodeProvider + Send + Sync + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    C: ClientContext,
 {
     /// Subscribes to notifications from the specified chain.
     async fn notifications(
         &self,
         chain_id: ChainId,
     ) -> Result<impl Stream<Item = Notification>, Error> {
-        let Some(client) = self.clients.client(&chain_id).await else {
-            return Err(Error::new("Unknown chain ID"));
-        };
-        Ok(ChainClient::listen(client).await?)
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
+        Ok(client.subscribe().await?)
     }
 }
 
-impl<P, S> MutationRoot<P, S>
+impl<C> MutationRoot<C>
 where
-    P: ValidatorNodeProvider + Send + Sync + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    C: ClientContext,
 {
     async fn execute_system_operation(
         &self,
         system_operation: SystemOperation,
         chain_id: ChainId,
     ) -> Result<CryptoHash, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let operation = Operation::System(system_operation);
-        Ok(client.execute_operation(operation).await?.value.hash())
+        let certificate = self
+            .apply_client_command(&chain_id, move |client| {
+                let operation = Operation::System(system_operation.clone());
+                async move {
+                    let result = client
+                        .execute_operation(operation)
+                        .await
+                        .map_err(Error::from);
+                    (result, client)
+                }
+            })
+            .await?;
+        Ok(certificate.hash())
+    }
+
+    /// Applies the given function to the chain client.
+    /// Updates the wallet regardless of the outcome. As long as the function returns a round
+    /// timeout, it will wait and retry.
+    async fn apply_client_command<F, Fut, T>(
+        &self,
+        chain_id: &ChainId,
+        mut f: F,
+    ) -> Result<T, Error>
+    where
+        F: FnMut(ChainClient<C::ValidatorNodeProvider, C::Storage>) -> Fut,
+        Fut: Future<
+            Output = (
+                Result<ClientOutcome<T>, Error>,
+                ChainClient<C::ValidatorNodeProvider, C::Storage>,
+            ),
+        >,
+    {
+        loop {
+            let client = self.context.lock().await.make_chain_client(*chain_id)?;
+            let mut stream = client.subscribe().await?;
+            let (result, client) = f(client).await;
+            self.context.lock().await.update_wallet(&client).await?;
+            let timeout = match result? {
+                ClientOutcome::Committed(t) => return Ok(t),
+                ClientOutcome::WaitForTimeout(timeout) => timeout,
+            };
+            drop(client);
+            util::wait_for_next_round(&mut stream, timeout).await;
+        }
     }
 }
 
-#[Object]
-impl<P, S> MutationRoot<P, S>
+#[async_graphql::Object(cache_control(no_cache))]
+impl<C> MutationRoot<C>
 where
-    P: ValidatorNodeProvider + Send + Sync + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    C: ClientContext,
 {
     /// Processes the inbox and returns the lists of certificate hashes that were created, if any.
     async fn process_inbox(&self, chain_id: ChainId) -> Result<Vec<CryptoHash>, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        client.synchronize_from_validators().await?;
-        let certificates = client.process_inbox().await?;
-        drop(client);
-        let hashes = certificates.into_iter().map(|cert| cert.hash()).collect();
-        Ok(hashes)
+        let mut hashes = Vec::new();
+        loop {
+            let client = self.context.lock().await.make_chain_client(chain_id)?;
+            client.synchronize_from_validators().await?;
+            let result = client.process_inbox_without_prepare().await;
+            self.context.lock().await.update_wallet(&client).await?;
+            let (certificates, maybe_timeout) = result?;
+            hashes.extend(certificates.into_iter().map(|cert| cert.hash()));
+            match maybe_timeout {
+                None => return Ok(hashes),
+                Some(timestamp) => {
+                    let mut stream = client.subscribe().await?;
+                    drop(client);
+                    util::wait_for_next_round(&mut stream, timestamp).await;
+                }
+            }
+        }
+    }
+
+    /// Retries the pending block that was unsuccessfully proposed earlier.
+    async fn retry_pending_block(&self, chain_id: ChainId) -> Result<Option<CryptoHash>, Error> {
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
+        let outcome = client.process_pending_block().await?;
+        self.context.lock().await.update_wallet(&client).await?;
+        match outcome {
+            ClientOutcome::Committed(Some(certificate)) => Ok(Some(certificate.hash())),
+            ClientOutcome::Committed(None) => Ok(None),
+            ClientOutcome::WaitForTimeout(timeout) => Err(Error::from(format!(
+                "Please try again at {}",
+                timeout.timestamp
+            ))),
+        }
     }
 
     /// Transfers `amount` units of value from the given owner's account to the recipient.
@@ -247,89 +269,239 @@ where
         owner: Option<Owner>,
         recipient: Recipient,
         amount: Amount,
-        user_data: Option<UserData>,
     ) -> Result<CryptoHash, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let certificate = client
-            .transfer(owner, amount, recipient, user_data.unwrap_or_default())
-            .await?;
-        Ok(certificate.hash())
+        self.apply_client_command(&chain_id, move |client| async move {
+            let result = client
+                .transfer(owner, amount, recipient)
+                .await
+                .map_err(Error::from)
+                .map(|outcome| outcome.map(|certificate| certificate.hash()));
+            (result, client)
+        })
+        .await
     }
 
-    /// Claims `amount` units of value from the given owner's account in
-    /// the remote `target` chain. Depending on its configuration (see also #464), the
-    /// `target` chain may refuse to process the message.
-    #[allow(clippy::too_many_arguments)]
+    /// Claims `amount` units of value from the given owner's account in the remote
+    /// `target` chain. Depending on its configuration, the `target` chain may refuse to
+    /// process the message.
     async fn claim(
         &self,
         chain_id: ChainId,
         owner: Owner,
-        target: ChainId,
+        target_id: ChainId,
         recipient: Recipient,
         amount: Amount,
-        user_data: Option<UserData>,
     ) -> Result<CryptoHash, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let certificate = client
-            .claim(
-                owner,
-                target,
-                recipient,
-                amount,
-                user_data.unwrap_or_default(),
-            )
-            .await?;
-        Ok(certificate.hash())
+        self.apply_client_command(&chain_id, move |client| async move {
+            let result = client
+                .claim(owner, target_id, recipient, amount)
+                .await
+                .map_err(Error::from)
+                .map(|outcome| outcome.map(|certificate| certificate.hash()));
+            (result, client)
+        })
+        .await
     }
 
-    /// Creates (or activates) a new chain by installing the given authentication key.
+    /// Test if a data blob is readable from a transaction in the current chain.
+    #[allow(clippy::too_many_arguments)]
+    // TODO(#2490): Consider removing or renaming this.
+    async fn read_data_blob(
+        &self,
+        chain_id: ChainId,
+        hash: CryptoHash,
+    ) -> Result<CryptoHash, Error> {
+        self.apply_client_command(&chain_id, move |client| async move {
+            let result = client
+                .read_data_blob(hash)
+                .await
+                .map_err(Error::from)
+                .map(|outcome| outcome.map(|certificate| certificate.hash()));
+            (result, client)
+        })
+        .await
+    }
+
+    /// Creates (or activates) a new chain with the given owner.
     /// This will automatically subscribe to the future committees created by `admin_id`.
-    async fn open_chain(&self, chain_id: ChainId, public_key: PublicKey) -> Result<ChainId, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let ownership = ChainOwnership::single(public_key);
-        let (message_id, _) = client.open_chain(ownership).await?;
+    async fn open_chain(
+        &self,
+        chain_id: ChainId,
+        owner: Owner,
+        balance: Option<Amount>,
+    ) -> Result<ChainId, Error> {
+        let ownership = ChainOwnership::single(owner);
+        let balance = balance.unwrap_or(Amount::ZERO);
+        let message_id = self
+            .apply_client_command(&chain_id, move |client| {
+                let ownership = ownership.clone();
+                async move {
+                    let result = client
+                        .open_chain(ownership, ApplicationPermissions::default(), balance)
+                        .await
+                        .map_err(Error::from)
+                        .map(|outcome| outcome.map(|(message_id, _)| message_id));
+                    (result, client)
+                }
+            })
+            .await?;
         Ok(ChainId::child(message_id))
     }
 
     /// Creates (or activates) a new chain by installing the given authentication keys.
     /// This will automatically subscribe to the future committees created by `admin_id`.
+    #[expect(clippy::too_many_arguments)]
     async fn open_multi_owner_chain(
         &self,
         chain_id: ChainId,
-        public_keys: Vec<PublicKey>,
+        application_permissions: Option<ApplicationPermissions>,
+        owners: Vec<Owner>,
+        weights: Option<Vec<u64>>,
+        multi_leader_rounds: Option<u32>,
+        balance: Option<Amount>,
+        #[graphql(desc = "The duration of the fast round, in milliseconds; default: no timeout")]
+        fast_round_ms: Option<u64>,
+        #[graphql(
+            desc = "The duration of the first single-leader and all multi-leader rounds",
+            default = 10_000
+        )]
+        base_timeout_ms: u64,
+        #[graphql(
+            desc = "The number of milliseconds by which the timeout increases after each \
+                    single-leader round",
+            default = 1_000
+        )]
+        timeout_increment_ms: u64,
+        #[graphql(
+            desc = "The age of an incoming tracked or protected message after which the \
+                    validators start transitioning the chain to fallback mode, in milliseconds.",
+            default = 86_400_000
+        )]
+        fallback_duration_ms: u64,
     ) -> Result<ChainId, Error> {
-        let Some(mut client) = self.clients.client_lock(&chain_id).await else {
-            return Err(Error::new("Unknown chain ID"));
+        let owners = if let Some(weights) = weights {
+            if weights.len() != owners.len() {
+                return Err(Error::new(format!(
+                    "There are {} owners but {} weights.",
+                    owners.len(),
+                    weights.len()
+                )));
+            }
+            owners.into_iter().zip(weights).collect::<Vec<_>>()
+        } else {
+            owners
+                .into_iter()
+                .zip(iter::repeat(100))
+                .collect::<Vec<_>>()
         };
-        let ownership = ChainOwnership::multiple(public_keys);
-        let (message_id, _) = client.open_chain(ownership).await?;
+        let multi_leader_rounds = multi_leader_rounds.unwrap_or(u32::MAX);
+        let timeout_config = TimeoutConfig {
+            fast_round_duration: fast_round_ms.map(TimeDelta::from_millis),
+            base_timeout: TimeDelta::from_millis(base_timeout_ms),
+            timeout_increment: TimeDelta::from_millis(timeout_increment_ms),
+            fallback_duration: TimeDelta::from_millis(fallback_duration_ms),
+        };
+        let ownership = ChainOwnership::multiple(owners, multi_leader_rounds, timeout_config);
+        let balance = balance.unwrap_or(Amount::ZERO);
+        let message_id = self
+            .apply_client_command(&chain_id, move |client| {
+                let ownership = ownership.clone();
+                let application_permissions = application_permissions.clone().unwrap_or_default();
+                async move {
+                    let result = client
+                        .open_chain(ownership, application_permissions, balance)
+                        .await
+                        .map_err(Error::from)
+                        .map(|outcome| outcome.map(|(message_id, _)| message_id));
+                    (result, client)
+                }
+            })
+            .await?;
         Ok(ChainId::child(message_id))
     }
 
-    /// Closes the chain.
-    async fn close_chain(&self, chain_id: ChainId) -> Result<CryptoHash, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let certificate = client.close_chain().await?;
-        Ok(certificate.hash())
+    /// Closes the chain. Returns `None` if it was already closed.
+    async fn close_chain(&self, chain_id: ChainId) -> Result<Option<CryptoHash>, Error> {
+        let maybe_cert = self
+            .apply_client_command(&chain_id, |client| async move {
+                let result = client.close_chain().await.map_err(Error::from);
+                (result, client)
+            })
+            .await?;
+        Ok(maybe_cert.as_ref().map(GenericCertificate::hash))
     }
 
     /// Changes the authentication key of the chain.
-    async fn change_owner(
-        &self,
-        chain_id: ChainId,
-        new_public_key: PublicKey,
-    ) -> Result<CryptoHash, Error> {
-        let operation = SystemOperation::ChangeOwner { new_public_key };
+    async fn change_owner(&self, chain_id: ChainId, new_owner: Owner) -> Result<CryptoHash, Error> {
+        let operation = SystemOperation::ChangeOwnership {
+            super_owners: vec![new_owner],
+            owners: Vec::new(),
+            multi_leader_rounds: 2,
+            open_multi_leader_rounds: false,
+            timeout_config: TimeoutConfig::default(),
+        };
         self.execute_system_operation(operation, chain_id).await
     }
 
     /// Changes the authentication key of the chain.
+    #[expect(clippy::too_many_arguments)]
     async fn change_multiple_owners(
         &self,
         chain_id: ChainId,
-        new_public_keys: Vec<PublicKey>,
+        new_owners: Vec<Owner>,
+        new_weights: Vec<u64>,
+        multi_leader_rounds: u32,
+        open_multi_leader_rounds: bool,
+        #[graphql(desc = "The duration of the fast round, in milliseconds; default: no timeout")]
+        fast_round_ms: Option<u64>,
+        #[graphql(
+            desc = "The duration of the first single-leader and all multi-leader rounds",
+            default = 10_000
+        )]
+        base_timeout_ms: u64,
+        #[graphql(
+            desc = "The number of milliseconds by which the timeout increases after each \
+                    single-leader round",
+            default = 1_000
+        )]
+        timeout_increment_ms: u64,
+        #[graphql(
+            desc = "The age of an incoming tracked or protected message after which the \
+                    validators start transitioning the chain to fallback mode, in milliseconds.",
+            default = 86_400_000
+        )]
+        fallback_duration_ms: u64,
     ) -> Result<CryptoHash, Error> {
-        let operation = SystemOperation::ChangeMultipleOwners { new_public_keys };
+        let operation = SystemOperation::ChangeOwnership {
+            super_owners: Vec::new(),
+            owners: new_owners.into_iter().zip(new_weights).collect(),
+            multi_leader_rounds,
+            open_multi_leader_rounds,
+            timeout_config: TimeoutConfig {
+                fast_round_duration: fast_round_ms.map(TimeDelta::from_millis),
+                base_timeout: TimeDelta::from_millis(base_timeout_ms),
+                timeout_increment: TimeDelta::from_millis(timeout_increment_ms),
+                fallback_duration: TimeDelta::from_millis(fallback_duration_ms),
+            },
+        };
+        self.execute_system_operation(operation, chain_id).await
+    }
+
+    /// Changes the application permissions configuration on this chain.
+    async fn change_application_permissions(
+        &self,
+        chain_id: ChainId,
+        close_chain: Vec<ApplicationId>,
+        execute_operations: Option<Vec<ApplicationId>>,
+        mandatory_applications: Vec<ApplicationId>,
+        change_application_permissions: Vec<ApplicationId>,
+    ) -> Result<CryptoHash, Error> {
+        let operation = SystemOperation::ChangeApplicationPermissions(ApplicationPermissions {
+            execute_operations,
+            mandatory_applications,
+            close_chain,
+            change_application_permissions,
+        });
         self.execute_system_operation(operation, chain_id).await
     }
 
@@ -392,9 +564,36 @@ where
         contract: Bytecode,
         service: Bytecode,
     ) -> Result<BytecodeId, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let (bytecode_id, _) = client.publish_bytecode(contract, service).await?;
-        Ok(bytecode_id)
+        self.apply_client_command(&chain_id, move |client| {
+            let contract = contract.clone();
+            let service = service.clone();
+            async move {
+                let result = client
+                    .publish_bytecode(contract, service)
+                    .await
+                    .map_err(Error::from)
+                    .map(|outcome| outcome.map(|(bytecode_id, _)| bytecode_id));
+                (result, client)
+            }
+        })
+        .await
+    }
+
+    /// Publishes a new data blob.
+    async fn publish_data_blob(
+        &self,
+        chain_id: ChainId,
+        bytes: Vec<u8>,
+    ) -> Result<CryptoHash, Error> {
+        self.apply_client_command(&chain_id, |client| {
+            let bytes = bytes.clone();
+            async move {
+                let result = client.publish_data_blob(bytes).await.map_err(Error::from);
+                (result, client)
+            }
+        })
+        .await
+        .map(|_| CryptoHash::new(&BlobContent::new_data(bytes)))
     }
 
     /// Creates a new application.
@@ -403,19 +602,28 @@ where
         chain_id: ChainId,
         bytecode_id: BytecodeId,
         parameters: String,
-        initialization_argument: String,
+        instantiation_argument: String,
         required_application_ids: Vec<UserApplicationId>,
     ) -> Result<ApplicationId, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let (application_id, _) = client
-            .create_application_untyped(
-                bytecode_id,
-                parameters.as_bytes().to_vec(),
-                initialization_argument.as_bytes().to_vec(),
-                required_application_ids,
-            )
-            .await?;
-        Ok(application_id)
+        self.apply_client_command(&chain_id, move |client| {
+            let parameters = parameters.as_bytes().to_vec();
+            let instantiation_argument = instantiation_argument.as_bytes().to_vec();
+            let required_application_ids = required_application_ids.clone();
+            async move {
+                let result = client
+                    .create_application_untyped(
+                        bytecode_id,
+                        parameters,
+                        instantiation_argument,
+                        required_application_ids,
+                    )
+                    .await
+                    .map_err(Error::from)
+                    .map(|outcome| outcome.map(|(application_id, _)| application_id));
+                (result, client)
+            }
+        })
+        .await
     }
 
     /// Requests a `RegisterApplications` message from another chain so the application can be used
@@ -426,31 +634,41 @@ where
         application_id: UserApplicationId,
         target_chain_id: Option<ChainId>,
     ) -> Result<CryptoHash, Error> {
-        let mut client = self.clients.try_client_lock(&chain_id).await?;
-        let certificate = client
-            .request_application(application_id, target_chain_id)
-            .await?;
-        Ok(certificate.hash())
+        loop {
+            let client = self.context.lock().await.make_chain_client(chain_id)?;
+            let result = client
+                .request_application(application_id, target_chain_id)
+                .await;
+            self.context.lock().await.update_wallet(&client).await?;
+            let timeout = match result? {
+                ClientOutcome::Committed(certificate) => return Ok(certificate.hash()),
+                ClientOutcome::WaitForTimeout(timeout) => timeout,
+            };
+            let mut stream = client.subscribe().await?;
+            drop(client);
+            util::wait_for_next_round(&mut stream, timeout).await;
+        }
     }
 }
 
-#[Object]
-impl<P, S> QueryRoot<P, S>
+#[async_graphql::Object(cache_control(no_cache))]
+impl<C> QueryRoot<C>
 where
-    P: ValidatorNodeProvider + Send + Sync + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    C: ClientContext,
 {
-    async fn chain(&self, chain_id: ChainId) -> Result<ChainStateExtendedView<S::Context>, Error> {
-        let client = self.clients.try_client_lock(&chain_id).await?;
-        let view = client.chain_state_view(Some(chain_id)).await?;
+    async fn chain(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<ChainStateExtendedView<<C::Storage as Storage>::Context>, Error> {
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
+        let view = client.chain_state_view().await?;
         Ok(ChainStateExtendedView::new(view))
     }
 
     async fn applications(&self, chain_id: ChainId) -> Result<Vec<ApplicationOverview>, Error> {
-        let client = self.clients.try_client_lock(&chain_id).await?;
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
         let applications = client
-            .chain_state_view(Some(chain_id))
+            .chain_state_view()
             .await?
             .execution_state
             .list_applications()
@@ -466,7 +684,7 @@ where
 
     async fn chains(&self) -> Result<Chains, Error> {
         Ok(Chains {
-            list: self.clients.0.lock().await.keys().cloned().collect(),
+            list: self.context.lock().await.wallet().chain_ids(),
             default: self.default_chain,
         })
     }
@@ -475,17 +693,17 @@ where
         &self,
         hash: Option<CryptoHash>,
         chain_id: ChainId,
-    ) -> Result<Option<HashedValue>, Error> {
-        let client = self.clients.try_client_lock(&chain_id).await?;
+    ) -> Result<Option<Hashed<ConfirmedBlock>>, Error> {
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
         let hash = match hash {
             Some(hash) => Some(hash),
             None => {
-                let view = client.chain_state_view(Some(chain_id)).await?;
+                let view = client.chain_state_view().await?;
                 view.tip_state.get().block_hash
             }
         };
         if let Some(hash) = hash {
-            let block = client.read_value(hash).await?;
+            let block = client.read_hashed_confirmed_block(hash).await?;
             Ok(Some(block))
         } else {
             Ok(None)
@@ -497,22 +715,29 @@ where
         from: Option<CryptoHash>,
         chain_id: ChainId,
         limit: Option<u32>,
-    ) -> Result<Vec<HashedValue>, Error> {
-        let client = self.clients.try_client_lock(&chain_id).await?;
+    ) -> Result<Vec<Hashed<ConfirmedBlock>>, Error> {
+        let client = self.context.lock().await.make_chain_client(chain_id)?;
         let limit = limit.unwrap_or(10);
         let from = match from {
             Some(from) => Some(from),
             None => {
-                let view = client.chain_state_view(Some(chain_id)).await?;
+                let view = client.chain_state_view().await?;
                 view.tip_state.get().block_hash
             }
         };
         if let Some(from) = from {
-            let values = client.read_values_downward(from, limit).await?;
+            let values = client
+                .read_hashed_confirmed_blocks_downward(from, limit)
+                .await?;
             Ok(values)
         } else {
             Ok(vec![])
         }
+    }
+
+    /// Returns the version information on this node service.
+    async fn version(&self) -> linera_version::VersionInfo {
+        linera_version::VersionInfo::default()
     }
 }
 
@@ -521,7 +746,7 @@ where
 
 struct ChainStateViewExtension(ChainId);
 
-#[Object]
+#[async_graphql::Object(cache_control(no_cache))]
 impl ChainStateViewExtension {
     async fn chain_id(&self) -> ChainId {
         self.0
@@ -529,20 +754,60 @@ impl ChainStateViewExtension {
 }
 
 #[derive(MergedObject)]
-struct ChainStateExtendedView<C>(ChainStateViewExtension, Arc<ChainStateView<C>>)
+struct ChainStateExtendedView<C>(ChainStateViewExtension, ReadOnlyChainStateView<C>)
 where
-    C: linera_views::common::Context + Clone + Send + Sync + 'static,
-    ViewError: From<C::Error>,
+    C: linera_views::context::Context + Clone + Send + Sync + 'static,
     C::Extra: linera_execution::ExecutionRuntimeContext;
+
+/// A wrapper type that allows proxying GraphQL queries to a [`ChainStateView`] that's behind an
+/// [`OwnedRwLockReadGuard`].
+pub struct ReadOnlyChainStateView<C>(OwnedRwLockReadGuard<ChainStateView<C>>)
+where
+    C: linera_views::context::Context + Clone + Send + Sync + 'static;
+
+impl<C> ContainerType for ReadOnlyChainStateView<C>
+where
+    C: linera_views::context::Context + Clone + Send + Sync + 'static,
+{
+    async fn resolve_field(
+        &self,
+        context: &async_graphql::Context<'_>,
+    ) -> async_graphql::ServerResult<Option<async_graphql::Value>> {
+        self.0.resolve_field(context).await
+    }
+}
+
+impl<C> OutputType for ReadOnlyChainStateView<C>
+where
+    C: linera_views::context::Context + Clone + Send + Sync + 'static,
+{
+    fn type_name() -> Cow<'static, str> {
+        ChainStateView::<C>::type_name()
+    }
+
+    fn create_type_info(registry: &mut async_graphql::registry::Registry) -> String {
+        ChainStateView::<C>::create_type_info(registry)
+    }
+
+    async fn resolve(
+        &self,
+        context: &async_graphql::ContextSelectionSet<'_>,
+        field: &async_graphql::Positioned<async_graphql::parser::types::Field>,
+    ) -> async_graphql::ServerResult<async_graphql::Value> {
+        self.0.resolve(context, field).await
+    }
+}
 
 impl<C> ChainStateExtendedView<C>
 where
-    C: linera_views::common::Context + Clone + Send + Sync + 'static,
-    ViewError: From<C::Error>,
+    C: linera_views::context::Context + Clone + Send + Sync + 'static,
     C::Extra: linera_execution::ExecutionRuntimeContext,
 {
-    fn new(view: Arc<ChainStateView<C>>) -> Self {
-        Self(ChainStateViewExtension(view.chain_id()), view)
+    fn new(view: OwnedRwLockReadGuard<ChainStateView<C>>) -> Self {
+        Self(
+            ChainStateViewExtension(view.chain_id()),
+            ReadOnlyChainStateView(view),
+        )
     }
 }
 
@@ -593,121 +858,85 @@ fn operation_type(document: &ExecutableDocument) -> Result<OperationType, NodeSe
     }
 }
 
-/// Extracts the underlying byte vector from a serialized GraphQL response
-/// from an application.
-fn bytes_from_response(data: async_graphql::Value) -> Vec<Vec<u8>> {
-    if let async_graphql::Value::Object(map) = data {
-        map.values()
-            .filter_map(|value| {
-                if let async_graphql::Value::List(list) = value {
-                    bytes_from_list(list)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        vec![]
-    }
-}
-
-fn bytes_from_list(list: &[async_graphql::Value]) -> Option<Vec<u8>> {
-    list.iter()
-        .map(|item| {
-            if let async_graphql::Value::Number(n) = item {
-                n.as_u64().map(|n| n as u8)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// An HTML response constructing the GraphiQL web page.
-async fn graphiql(uri: Uri) -> impl IntoResponse {
-    response::Html(
-        GraphiQLSource::build()
-            .endpoint(uri.path())
-            .subscription_endpoint("/ws")
-            .finish(),
-    )
-}
-
 /// The `NodeService` is a server that exposes a web-server to the client.
 /// The node service is primarily used to explore the state of a chain in GraphQL.
-pub struct NodeService<P, S> {
-    clients: ChainClients<P, S>,
+pub struct NodeService<C>
+where
+    C: ClientContext,
+{
     config: ChainListenerConfig,
     port: NonZeroU16,
     default_chain: Option<ChainId>,
-    storage: S,
+    storage: C::Storage,
+    context: Arc<Mutex<C>>,
 }
 
-impl<P, S: Clone> Clone for NodeService<P, S> {
+impl<C> Clone for NodeService<C>
+where
+    C: ClientContext,
+{
     fn clone(&self) -> Self {
         Self {
-            clients: self.clients.clone(),
             config: self.config.clone(),
             port: self.port,
             default_chain: self.default_chain,
             storage: self.storage.clone(),
+            context: Arc::clone(&self.context),
         }
     }
 }
 
-impl<P, S> NodeService<P, S>
+impl<C> NodeService<C>
 where
-    P: ValidatorNodeProvider + Send + Sync + 'static,
-    S: Store + Clone + Send + Sync + 'static,
-    ViewError: From<S::ContextError>,
+    C: ClientContext,
 {
     /// Creates a new instance of the node service given a client chain and a port.
-    pub fn new(
+    pub async fn new(
         config: ChainListenerConfig,
         port: NonZeroU16,
         default_chain: Option<ChainId>,
-        storage: S,
+        storage: C::Storage,
+        context: C,
     ) -> Self {
         Self {
-            clients: ChainClients::default(),
             config,
             port,
             default_chain,
             storage,
+            context: Arc::new(Mutex::new(context)),
         }
     }
 
-    pub fn schema(&self) -> Schema<QueryRoot<P, S>, MutationRoot<P, S>, SubscriptionRoot<P, S>> {
+    pub fn schema(&self) -> Schema<QueryRoot<C>, MutationRoot<C>, SubscriptionRoot<C>> {
         Schema::build(
             QueryRoot {
-                clients: self.clients.clone(),
+                context: Arc::clone(&self.context),
                 port: self.port,
                 default_chain: self.default_chain,
             },
             MutationRoot {
-                clients: self.clients.clone(),
+                context: Arc::clone(&self.context),
             },
             SubscriptionRoot {
-                clients: self.clients.clone(),
+                context: Arc::clone(&self.context),
             },
         )
         .finish()
     }
 
     /// Runs the node service.
-    pub async fn run<C>(self, context: C) -> Result<(), anyhow::Error>
-    where
-        C: ClientContext<P> + Send + 'static,
-    {
+    #[instrument(name = "node_service", level = "info", skip(self), fields(port = ?self.port))]
+    pub async fn run(self) -> Result<(), anyhow::Error> {
         let port = self.port.get();
-        let index_handler = axum::routing::get(graphiql).post(Self::index_handler);
-        let applications_handler = axum::routing::get(graphiql).post(Self::application_handler);
+        let index_handler = axum::routing::get(util::graphiql).post(Self::index_handler);
+        let application_handler =
+            axum::routing::get(util::graphiql).post(Self::application_handler);
 
         let app = Router::new()
             .route("/", index_handler)
             .route(
                 "/chains/:chain_id/applications/:application_id",
-                applications_handler,
+                application_handler,
             )
             .route("/ready", axum::routing::get(|| async { "ready!" }))
             .route_service("/ws", GraphQLSubscription::new(self.schema()))
@@ -717,9 +946,13 @@ where
 
         info!("GraphiQL IDE: http://localhost:{}", port);
 
-        ChainListener::new(self.config, self.clients.clone()).run(context, self.storage.clone());
-        let serve_fut =
-            Server::bind(&SocketAddr::from(([127, 0, 0, 1], port))).serve(app.into_make_service());
+        ChainListener::new(self.config)
+            .run(Arc::clone(&self.context), self.storage.clone())
+            .await;
+        let serve_fut = axum::serve(
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?,
+            app,
+        );
         serve_fut.await?;
 
         Ok(())
@@ -732,19 +965,18 @@ where
         request: &Request,
         chain_id: ChainId,
     ) -> Result<async_graphql::Response, NodeServiceError> {
-        let bytes = serde_json::to_vec(&request)?;
-        let query = Query::User {
-            application_id,
-            bytes,
-        };
-        let Some(client) = self.clients.client_lock(&chain_id).await else {
-            return Err(NodeServiceError::UnknownChainId);
-        };
-        let response = client.query_application(&query).await?;
-        let user_response_bytes = match response {
-            Response::System(_) => unreachable!("cannot get a system response for a user query"),
-            Response::User(user) => user,
-        };
+        let QueryOutcome {
+            response: user_response_bytes,
+            operations,
+        } = self
+            .query_user_application(application_id, request, chain_id)
+            .await?;
+
+        ensure!(
+            operations.is_empty(),
+            NodeServiceError::UnexpectedOperationsFromQuery
+        );
+
         Ok(serde_json::from_slice(&user_response_bytes)?)
     }
 
@@ -756,9 +988,13 @@ where
         chain_id: ChainId,
     ) -> Result<async_graphql::Response, NodeServiceError> {
         debug!("Request: {:?}", &request);
-        let graphql_response = self
-            .user_application_query(application_id, request, chain_id)
+        let QueryOutcome {
+            response,
+            operations,
+        } = self
+            .query_user_application(application_id, request, chain_id)
             .await?;
+        let graphql_response = serde_json::from_slice::<async_graphql::Response>(&response)?;
         if graphql_response.is_err() {
             let errors = graphql_response
                 .errors
@@ -767,24 +1003,65 @@ where
                 .collect();
             return Err(NodeServiceError::ApplicationServiceError { errors });
         }
-        debug!("Response: {:?}", &graphql_response);
-        let bcs_bytes_list = bytes_from_response(graphql_response.data);
-        if bcs_bytes_list.is_empty() {
-            return Err(NodeServiceError::MalformedApplicationResponse);
-        }
-        let operations = bcs_bytes_list
-            .into_iter()
-            .map(|bytes| Operation::User {
-                application_id,
-                bytes,
-            })
-            .collect();
+        trace!("Operations: {operations:?}");
 
-        let Some(mut client) = self.clients.client_lock(&chain_id).await else {
-            return Err(NodeServiceError::UnknownChainId);
+        let client = self
+            .context
+            .lock()
+            .await
+            .make_chain_client(chain_id)
+            .map_err(|_| NodeServiceError::UnknownChainId {
+                chain_id: chain_id.to_string(),
+            })?;
+        let hash = loop {
+            let timeout = match client
+                .execute_operations(operations.clone(), vec![])
+                .await?
+            {
+                ClientOutcome::Committed(certificate) => break certificate.hash(),
+                ClientOutcome::WaitForTimeout(timeout) => timeout,
+            };
+            let mut stream = client.subscribe().await.map_err(|_| {
+                ChainClientError::InternalError("Could not subscribe to the local node.")
+            })?;
+            util::wait_for_next_round(&mut stream, timeout).await;
         };
-        let hash = client.execute_operations(operations).await?.value.hash();
         Ok(async_graphql::Response::new(hash.to_value()))
+    }
+
+    /// Queries a user application, returning the raw [`QueryOutcome`].
+    async fn query_user_application(
+        &self,
+        application_id: UserApplicationId,
+        request: &Request,
+        chain_id: ChainId,
+    ) -> Result<QueryOutcome<Vec<u8>>, NodeServiceError> {
+        let bytes = serde_json::to_vec(&request)?;
+        let query = Query::User {
+            application_id,
+            bytes,
+        };
+        let client = self
+            .context
+            .lock()
+            .await
+            .make_chain_client(chain_id)
+            .map_err(|_| NodeServiceError::UnknownChainId {
+                chain_id: chain_id.to_string(),
+            })?;
+        let QueryOutcome {
+            response,
+            operations,
+        } = client.query_application(query).await?;
+        match response {
+            QueryResponse::System(_) => {
+                unreachable!("cannot get a system response for a user query")
+            }
+            QueryResponse::User(user_response_bytes) => Ok(QueryOutcome {
+                response: user_response_bytes,
+                operations,
+            }),
+        }
     }
 
     /// Executes a GraphQL query and generates a response for our `Schema`.

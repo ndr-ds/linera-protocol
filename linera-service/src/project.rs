@@ -1,111 +1,94 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::util;
-use anyhow::{anyhow, bail, Context, Result};
-use cargo_toml::Manifest;
-use current_platform::CURRENT_PLATFORM;
 use std::{
-    ffi::OsStr,
-    fs::File,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
-use tracing::{debug, info};
+
+use anyhow::{ensure, Context, Result};
+use cargo_toml::Manifest;
+use convert_case::{Case, Casing};
+use current_platform::CURRENT_PLATFORM;
+use fs_err::File;
+use tracing::debug;
 
 pub struct Project {
     root: PathBuf,
 }
 
-const RUNNER_BIN_NAME: &str = "test-runner";
-
 impl Project {
-    pub fn new(root: PathBuf) -> Result<Self> {
-        if root.exists() {
-            bail!("destination {} already exists", root.display());
-        }
-        if root.extension().is_some() {
-            bail!("project name must be a directory");
-        }
-        debug!("creating directory at {}", root.display());
-        std::fs::create_dir_all(&root)?;
+    pub fn create_new(name: &str, linera_root: Option<&Path>) -> Result<Self> {
+        ensure!(
+            !name.contains(std::path::is_separator),
+            "Project name {name} should not contain path-separators",
+        );
+        let root = PathBuf::from(name);
+        ensure!(
+            !root.exists(),
+            "Directory {} already exists",
+            root.display(),
+        );
+        ensure!(
+            root.extension().is_none(),
+            "Project name {name} should not have a file extension",
+        );
+        debug!("Creating directory at {}", root.display());
+        fs_err::create_dir_all(&root)?;
 
-        debug!("creating the source directory");
+        debug!("Creating the source directory");
         let source_directory = Self::create_source_directory(&root)?;
 
-        debug!("initializing git repository");
+        debug!("Creating the tests directory");
+        let test_directory = Self::create_test_directory(&root)?;
+
+        debug!("Initializing git repository");
         Self::initialize_git_repository(&root)?;
 
-        let project_name = root
-            .file_name()
-            .and_then(OsStr::to_str)
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("path specified cannot terminate in . or .."))?;
+        debug!("Writing Cargo.toml");
+        Self::create_cargo_toml(&root, name, linera_root)?;
 
-        debug!("writing Cargo.toml");
-        Self::create_cargo_toml(&root, &project_name)?;
-
-        debug!("writing rust-toolchain");
+        debug!("Writing rust-toolchain.toml");
         Self::create_rust_toolchain(&root)?;
 
-        debug!("writing state.rs");
-        Self::create_state_file(&source_directory)?;
+        debug!("Writing state.rs");
+        Self::create_state_file(&source_directory, name)?;
 
-        debug!("writing lib.rs");
-        Self::create_lib_file(&source_directory)?;
+        debug!("Writing lib.rs");
+        Self::create_lib_file(&source_directory, name)?;
 
-        debug!("writing contract.rs");
-        Self::create_contract_file(&source_directory, &project_name)?;
+        debug!("Writing contract.rs");
+        Self::create_contract_file(&source_directory, name)?;
 
-        debug!("writing service.rs");
-        Self::create_service_file(&source_directory, &project_name)?;
+        debug!("Writing service.rs");
+        Self::create_service_file(&source_directory, name)?;
 
-        debug!("creating cargo config");
-        Self::create_cargo_config(&root)?;
+        debug!("Writing single_chain.rs");
+        Self::create_test_file(&test_directory, name)?;
 
         Ok(Self { root })
     }
 
     pub fn from_existing_project(root: PathBuf) -> Result<Self> {
-        if !root.exists() {
-            bail!("could not find project at {}", root.display());
-        }
+        ensure!(
+            root.exists(),
+            "could not find project at {}",
+            root.display()
+        );
         Ok(Self { root })
     }
 
-    pub fn test(&self) -> Result<()> {
-        if !Self::runner_is_installed()? {
-            debug!("Linera test runner not found");
-            Self::install_test_runner()?;
-        }
-        let unit_tests = Command::new("cargo")
-            .env(
-                "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",
-                Self::runner_path()?.display().to_string().as_str(),
-            )
-            .arg("test")
-            .args(["--target", "wasm32-unknown-unknown"])
-            .current_dir(&self.root)
-            .spawn()?
-            .wait()?;
-        if !unit_tests.success() {
-            bail!("unit tests failed")
-        }
-        let integration_tests = Command::new("cargo")
+    /// Runs the unit and integration tests of an application.
+    pub async fn test(&self) -> Result<()> {
+        let tests = Command::new("cargo")
             .arg("test")
             .args(["--target", CURRENT_PLATFORM])
             .current_dir(&self.root)
             .spawn()?
             .wait()?;
-        if !integration_tests.success() {
-            bail!("integration tests failed")
-        }
+        ensure!(tests.success(), "tests failed");
         Ok(())
-    }
-
-    pub fn runner_is_installed() -> Result<bool> {
-        Ok(Self::runner_path()?.exists())
     }
 
     /// Finds the workspace for a given crate. If the workspace
@@ -130,27 +113,16 @@ impl Project {
         Ok(self.root.as_path())
     }
 
-    fn install_test_runner() -> Result<()> {
-        info!("installing test runner...");
-        let cargo_install = Command::new("cargo")
-            .args(["install", "linera-sdk"])
-            .args(["--bin", RUNNER_BIN_NAME])
-            .spawn()?
-            .wait()?;
-        if !cargo_install.success() {
-            bail!("failed to install {}", &RUNNER_BIN_NAME)
-        }
-        Ok(())
-    }
-
-    fn runner_path() -> Result<PathBuf> {
-        util::resolve_cargo_binary(RUNNER_BIN_NAME)
-    }
-
     fn create_source_directory(project_root: &Path) -> Result<PathBuf> {
         let source_directory = project_root.join("src");
-        std::fs::create_dir(&source_directory)?;
+        fs_err::create_dir(&source_directory)?;
         Ok(source_directory)
+    }
+
+    fn create_test_directory(project_root: &Path) -> Result<PathBuf> {
+        let test_directory = project_root.join("tests");
+        fs_err::create_dir(&test_directory)?;
+        Ok(test_directory)
     }
 
     fn initialize_git_repository(project_root: &Path) -> Result<()> {
@@ -163,76 +135,94 @@ impl Project {
             ])
             .output()?;
 
-        if !output.status.success() {
-            bail!(
-                "failed to initialize git repository at {}",
-                &project_root.display()
-            );
-        }
+        ensure!(
+            output.status.success(),
+            "failed to initialize git repository at {}",
+            &project_root.display()
+        );
 
         Self::write_string_to_file(&project_root.join(".gitignore"), "/target")
     }
 
-    fn create_cargo_toml(project_root: &Path, project_name: &str) -> Result<()> {
+    fn create_cargo_toml(
+        project_root: &Path,
+        project_name: &str,
+        linera_root: Option<&Path>,
+    ) -> Result<()> {
         let toml_path = project_root.join("Cargo.toml");
-        let (linera_sdk_dep, linera_sdk_dev_dep, linera_views_dep) =
-            Self::linera_sdk_dependencies();
+        let (linera_sdk_dep, linera_sdk_dev_dep) = Self::linera_sdk_dependencies(linera_root);
+        let binary_root_name = project_name.replace('-', "_");
+        let contract_binary_name = format!("{binary_root_name}_contract");
+        let service_binary_name = format!("{binary_root_name}_service");
         let toml_contents = format!(
             include_str!("../template/Cargo.toml.template"),
             project_name = project_name,
+            contract_binary_name = contract_binary_name,
+            service_binary_name = service_binary_name,
             linera_sdk_dep = linera_sdk_dep,
             linera_sdk_dev_dep = linera_sdk_dev_dep,
-            linera_views_dep = linera_views_dep
         );
         Self::write_string_to_file(&toml_path, &toml_contents)
     }
 
     fn create_rust_toolchain(project_root: &Path) -> Result<()> {
-        let toolchain_path = project_root.join("rust-toolchain");
         Self::write_string_to_file(
-            &toolchain_path,
-            include_str!("../template/rust-toolchain.template"),
+            &project_root.join("rust-toolchain.toml"),
+            include_str!("../template/rust-toolchain.toml.template"),
         )
     }
 
-    fn create_state_file(source_directory: &Path) -> Result<()> {
+    fn create_state_file(source_directory: &Path, project_name: &str) -> Result<()> {
+        let project_name = project_name.to_case(Case::Pascal);
         let state_path = source_directory.join("state.rs");
-        Self::write_string_to_file(&state_path, include_str!("../template/state.rs.template"))
+        let file_content = format!(
+            include_str!("../template/state.rs.template"),
+            project_name = project_name
+        );
+        Self::write_string_to_file(&state_path, &file_content)
     }
 
-    fn create_lib_file(source_directory: &Path) -> Result<()> {
+    fn create_lib_file(source_directory: &Path, project_name: &str) -> Result<()> {
+        let project_name = project_name.to_case(Case::Pascal);
         let state_path = source_directory.join("lib.rs");
-        Self::write_string_to_file(&state_path, include_str!("../template/lib.rs.template"))
+        let file_content = format!(
+            include_str!("../template/lib.rs.template"),
+            project_name = project_name
+        );
+        Self::write_string_to_file(&state_path, &file_content)
     }
 
-    fn create_contract_file(source_directory: &Path, project_name: &str) -> Result<()> {
-        let project_name = project_name.replace('-', "_");
+    fn create_contract_file(source_directory: &Path, name: &str) -> Result<()> {
+        let project_name = name.to_case(Case::Pascal);
         let contract_path = source_directory.join("contract.rs");
         let contract_contents = format!(
             include_str!("../template/contract.rs.template"),
+            module_name = name.replace('-', "_"),
             project_name = project_name
         );
         Self::write_string_to_file(&contract_path, &contract_contents)
     }
 
-    fn create_service_file(source_directory: &Path, project_name: &str) -> Result<()> {
-        let project_name = project_name.replace('-', "_");
+    fn create_service_file(source_directory: &Path, name: &str) -> Result<()> {
+        let project_name = name.to_case(Case::Pascal);
         let service_path = source_directory.join("service.rs");
         let service_contents = format!(
             include_str!("../template/service.rs.template"),
+            module_name = name.replace('-', "_"),
             project_name = project_name
         );
         Self::write_string_to_file(&service_path, &service_contents)
     }
 
-    fn create_cargo_config(project_root: &Path) -> Result<()> {
-        let config_dir_path = project_root.join(".cargo");
-        let config_file_path = config_dir_path.join("config.toml");
-        std::fs::create_dir(&config_dir_path)?;
-        Self::write_string_to_file(
-            &config_file_path,
-            include_str!("../template/config.toml.template"),
-        )
+    fn create_test_file(test_directory: &Path, name: &str) -> Result<()> {
+        let project_name = name.to_case(Case::Pascal);
+        let test_path = test_directory.join("single_chain.rs");
+        let test_contents = format!(
+            include_str!("../template/tests/single_chain.rs.template"),
+            project_name = name.replace('-', "_"),
+            project_abi = project_name,
+        );
+        Self::write_string_to_file(&test_path, &test_contents)
     }
 
     fn write_string_to_file(path: &Path, content: &str) -> Result<()> {
@@ -241,55 +231,46 @@ impl Project {
         Ok(())
     }
 
-    /// Resolves ['linera-sdk'] and [`linera-views`] dependencies in `debug` mode.
-    ///
-    /// Uses the directory of `linera-service` at compile time to figure out
-    /// where `linera-sdk` and `linera-views' is.
-    #[cfg(debug_assertions)]
-    fn linera_sdk_dependencies() -> (String, String, String) {
-        let linera_service_path: PathBuf = env!("CARGO_MANIFEST_DIR")
-            .parse()
-            .expect("the CARGO_MANIFEST_DIR should always be a valid path");
-        let linera_sdk_path = linera_service_path
-            .join("..")
-            .join("linera-sdk")
-            .canonicalize()
-            .expect("the linera-sdk crate should always exist");
-        let linera_views_path = linera_service_path
-            .join("..")
-            .join("linera-views")
-            .canonicalize()
-            .expect("the linera-sdk crate should always exist");
+    /// Resolves [`linera_sdk`] and [`linera_views`] dependencies.
+    fn linera_sdk_dependencies(linera_root: Option<&Path>) -> (String, String) {
+        match linera_root {
+            Some(path) => Self::linera_sdk_testing_dependencies(path),
+            None => Self::linera_sdk_production_dependencies(),
+        }
+    }
+
+    /// Resolves [`linera_sdk`] and [`linera_views`] dependencies in testing mode.
+    fn linera_sdk_testing_dependencies(linera_root: &Path) -> (String, String) {
+        // We're putting the Cargo.toml file one level above the current directory.
+        let linera_root = PathBuf::from("..").join(linera_root);
+        let linera_sdk_path = linera_root.join("linera-sdk");
         let linera_sdk_dep = format!(
             "linera-sdk = {{ path = \"{}\" }}",
             linera_sdk_path.display()
         );
         let linera_sdk_dev_dep = format!(
-            "linera-sdk = {{ path = \"{}\", features = [\"test\"] }}",
+            "linera-sdk = {{ path = \"{}\", features = [\"test\", \"wasmer\"] }}",
             linera_sdk_path.display()
         );
-        let linera_views_dep = format!(
-            "linera-views = {{ path = \"{}\" }}",
-            linera_views_path.display()
-        );
-        (linera_sdk_dep, linera_sdk_dev_dep, linera_views_dep)
+        (linera_sdk_dep, linera_sdk_dev_dep)
     }
 
-    /// Adds ['linera-sdk'] dependencies in `release` mode.
-    #[cfg(not(debug_assertions))]
-    fn linera_sdk_dependencies() -> (String, String, String) {
+    /// Adds [`linera_sdk`] dependencies in production mode.
+    fn linera_sdk_production_dependencies() -> (String, String) {
         let version = env!("CARGO_PKG_VERSION");
         let linera_sdk_dep = format!("linera-sdk = \"{}\"", version);
         let linera_sdk_dev_dep = format!(
-            "linera-sdk = {{ version = \"{}\", features = [\"test\"] }}",
+            "linera-sdk = {{ version = \"{}\", features = [\"test\", \"wasmer\"] }}",
             version
         );
-        let linera_views_dep = format!("linera-views = \"{}\"", version);
-        (linera_sdk_dep, linera_sdk_dev_dep, linera_views_dep)
+        (linera_sdk_dep, linera_sdk_dev_dep)
     }
 
     pub fn build(&self, name: Option<String>) -> Result<(PathBuf, PathBuf), anyhow::Error> {
-        let name = name.unwrap_or(self.project_package_name()?);
+        let name = match name {
+            Some(name) => name,
+            None => self.project_package_name()?.replace('-', "_"),
+        };
         let contract_name = format!("{}_contract", name);
         let service_name = format!("{}_service", name);
         let cargo_build = Command::new("cargo")
@@ -299,9 +280,7 @@ impl Project {
             .current_dir(&self.root)
             .spawn()?
             .wait()?;
-        if !cargo_build.success() {
-            bail!("build failed")
-        }
+        ensure!(cargo_build.success(), "build failed");
         let build_path = self
             .workspace_root()?
             .join("target/wasm32-unknown-unknown/release");

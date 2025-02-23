@@ -8,8 +8,9 @@
 //! function finishes without such an instruction in Wasmer no fuel is consumed, while in Wasmtime,
 //! one unit of fuel is consumed.
 
-use crate::Bytecode;
 use std::{borrow::Cow, mem, ops::Range};
+
+use linera_base::data_types::Bytecode;
 use wasm_encoder::{Encode, Function};
 use wasmparser::{BinaryReaderError, FunctionBody, Parser, Payload};
 
@@ -403,10 +404,11 @@ impl<'bytecode> Sanitizer<'bytecode> {
     }
 }
 
-#[cfg(all(test, feature = "wasmer"))]
+#[cfg(test)]
 mod tests {
+    use linera_base::data_types::Bytecode;
+
     use super::sanitize;
-    use crate::Bytecode;
 
     /// Tests if an already sanitized bytecode isn't changed.
     #[test]
