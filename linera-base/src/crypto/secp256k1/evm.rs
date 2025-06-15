@@ -32,7 +32,7 @@ const EVM_SECP256K1_SCHEME_LABEL: &str = "evm_secp256k1";
 const EVM_SECP256K1_PUBLIC_KEY_SIZE: usize = 33;
 
 /// Length of secp256k1 signature.
-const EVM_SECP256K1_SIGNATURE_SIZE: usize = 64;
+const EVM_SECP256K1_SIGNATURE_SIZE: usize = 65;
 
 /// A secp256k1 secret key.
 pub struct EvmSecretKey(pub SigningKey);
@@ -65,16 +65,15 @@ pub struct EvmKeyPair {
 
 /// A secp256k1 signature.
 #[derive(Eq, PartialEq, Copy, Clone)]
-pub struct EvmSignature(pub(crate) Signature);
+pub struct EvmSignature(pub Signature);
 
-#[cfg(with_testing)]
 impl FromStr for EvmSignature {
     type Err = CryptoError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = hex::decode(s)?;
-        let sig = Signature::from_erc2098(&bytes);
-        Ok(EvmSignature(sig))
+        // If the string starts with "0x", we remove it before decoding.
+        let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
+        Self::from_slice(&bytes)
     }
 }
 
@@ -113,6 +112,34 @@ impl EvmPublicKey {
                 Err(error)
             }
         }
+    }
+
+    /// Returns an EVM address for the public key.
+    pub fn address(&self) -> alloy_primitives::Address {
+        alloy_primitives::Address::from_public_key(&self.0)
+    }
+
+    /// Recovers the public key from the signature and the value.
+    ///
+    /// This function turns the `value` into a `CryptoHash`, then hashes it using EIP-191
+    /// and finally recovers the public key from the signature.
+    pub fn recover_from_msg<'de, T>(
+        signature: &EvmSignature,
+        value: &T,
+    ) -> Result<Self, CryptoError>
+    where
+        T: BcsSignable<'de>,
+    {
+        let message = CryptoHash::new(value).as_bytes().0;
+        let public_key =
+            signature
+                .0
+                .recover_from_msg(message)
+                .map_err(|_| CryptoError::InvalidSignature {
+                    error: "Failed to recover public key from signature".to_string(),
+                    type_name: Self::type_name().to_string(),
+                })?;
+        Ok(EvmPublicKey(public_key))
     }
 }
 
@@ -195,7 +222,9 @@ impl FromStr for EvmPublicKey {
     type Err = CryptoError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        hex::decode(s)?.as_slice().try_into()
+        hex::decode(s.strip_prefix("0x").unwrap_or(s))?
+            .as_slice()
+            .try_into()
     }
 }
 
@@ -368,37 +397,64 @@ impl EvmSecretKey {
     pub fn generate_from<R: crate::crypto::CryptoRng>(rng: &mut R) -> Self {
         EvmSecretKey(SigningKey::random(rng))
     }
+
+    /// Returns an EVM address for the public key.
+    pub fn address(&self) -> alloy_primitives::Address {
+        alloy_primitives::Address::from_private_key(&self.0)
+    }
 }
 
 impl EvmSignature {
-    /// Computes a secp256k1 signature for `value` using the given `secret`.
-    /// It first serializes the `T` type and then creates the `CryptoHash` from the serialized bytes.
-    pub fn new<'de, T>(value: &T, secret: &EvmSecretKey) -> Self
-    where
-        T: BcsSignable<'de>,
-    {
-        Self::sign_prehash(secret, CryptoHash::new(value))
+    /// Computes a secp256k1 signature for `prehash` using the given `secret`.
+    pub fn new(prehash: CryptoHash, secret: &EvmSecretKey) -> Self {
+        Self::sign_prehash(secret, prehash)
     }
 
     /// Computes a signature from a prehash.
     pub fn sign_prehash(secret: &EvmSecretKey, prehash: CryptoHash) -> Self {
-        use k256::ecdsa::signature::hazmat::PrehashSigner;
-
         let message = eip191_hash_message(prehash.as_bytes().0).0;
         let (signature, rid) = secret
             .0
-            .sign_prehash(&message)
+            .sign_prehash_recoverable(&message)
             .expect("Failed to sign prehashed data"); // NOTE: This is a critical error we don't control.
         EvmSignature((signature, rid).into())
     }
 
     /// Checks a signature.
-    pub fn check<'de, T>(&self, value: &T, author: &EvmPublicKey) -> Result<(), CryptoError>
+    pub fn check<'de, T>(&self, value: &T, author: EvmPublicKey) -> Result<(), CryptoError>
     where
         T: BcsSignable<'de> + fmt::Debug,
     {
         let prehash = CryptoHash::new(value).as_bytes().0;
         self.verify_inner::<T>(prehash, author)
+    }
+
+    /// Checks a signature against a recovered public key.
+    pub fn check_with_recover<'de, T>(
+        &self,
+        value: &T,
+        sender_address: [u8; 20],
+    ) -> Result<EvmPublicKey, CryptoError>
+    where
+        T: BcsSignable<'de> + fmt::Debug,
+    {
+        let msg = CryptoHash::new(value).as_bytes().0;
+        let recovered_public_key = match self.0.recover_from_msg(msg) {
+            Ok(public_key) => EvmPublicKey(public_key),
+            Err(_) => {
+                return Err(CryptoError::InvalidSignature {
+                    error: "Failed to recover public key from signature".to_string(),
+                    type_name: T::type_name().to_string(),
+                });
+            }
+        };
+        if recovered_public_key.address() != alloy_primitives::Address::new(sender_address) {
+            return Err(CryptoError::InvalidSignature {
+                error: "Recovered public key does not match sender address".to_string(),
+                type_name: T::type_name().to_string(),
+            });
+        }
+        Ok(recovered_public_key)
     }
 
     /// Verifies a batch of signatures.
@@ -411,20 +467,20 @@ impl EvmSignature {
     {
         let prehash = CryptoHash::new(value).as_bytes().0;
         for (author, signature) in votes {
-            signature.verify_inner::<T>(prehash, author)?;
+            signature.verify_inner::<T>(prehash, *author)?;
         }
         Ok(())
     }
 
     /// Returns the byte representation of the signature.
     pub fn as_bytes(&self) -> [u8; EVM_SECP256K1_SIGNATURE_SIZE] {
-        self.0.as_erc2098()
+        self.0.as_bytes()
     }
 
     fn verify_inner<'de, T>(
         &self,
         prehash: [u8; 32],
-        author: &EvmPublicKey,
+        author: EvmPublicKey,
     ) -> Result<(), CryptoError>
     where
         T: BcsSignable<'de> + fmt::Debug,
@@ -435,7 +491,10 @@ impl EvmSignature {
 
         author
             .0
-            .verify_prehash(&message_hash, &self.0.to_k256().unwrap())
+            .verify_prehash(
+                &message_hash,
+                &self.0.to_k256().map_err(CryptoError::Secp256k1Error)?,
+            )
             .map_err(|error| CryptoError::InvalidSignature {
                 error: error.to_string(),
                 type_name: T::type_name().to_string(),
@@ -446,14 +505,13 @@ impl EvmSignature {
     /// Expects the signature to be serialized in raw-bytes form.
     pub fn from_slice<A: AsRef<[u8]>>(bytes: A) -> Result<Self, CryptoError> {
         let bytes = bytes.as_ref();
-        if bytes.len() < 64 {
-            return Err(CryptoError::IncorrectSignatureBytes {
+        let sig = alloy_primitives::Signature::from_raw(bytes).map_err(|_| {
+            CryptoError::IncorrectSignatureBytes {
                 scheme: EVM_SECP256K1_SCHEME_LABEL,
                 len: bytes.len(),
                 expected: EVM_SECP256K1_SIGNATURE_SIZE,
-            });
-        }
-        let sig = alloy_primitives::Signature::from_erc2098(bytes);
+            }
+        })?;
         Ok(EvmSignature(sig))
     }
 }
@@ -521,7 +579,7 @@ mod serde_utils {
     #[serde_as]
     #[derive(Serialize, Deserialize)]
     #[serde(transparent)]
-    pub struct CompactSignature(#[serde_as(as = "[_; 64]")] pub [u8; EVM_SECP256K1_SIGNATURE_SIZE]);
+    pub struct CompactSignature(#[serde_as(as = "[_; 65]")] pub [u8; EVM_SECP256K1_SIGNATURE_SIZE]);
 
     #[serde_as]
     #[derive(Serialize, Deserialize)]
@@ -534,12 +592,32 @@ mod serde_utils {
 #[cfg(with_testing)]
 mod tests {
     #[test]
+    fn eip191_compatibility() {
+        use std::str::FromStr;
+
+        use crate::crypto::{CryptoHash, EvmSecretKey, EvmSignature};
+
+        // Generated in MetaMask.
+        let secret_key = "f77a21701522a03b01c111ad2d2cdaf2b8403b47507ee0aec3c2e52b765d7a66";
+        let signer = EvmSecretKey::from_str(secret_key).unwrap();
+
+        let crypto_hash = CryptoHash::from_str(
+            "c520e2b24b05e70c39c36d4aa98e9129ac0079ea002d4c382e6996ea11946d1e",
+        )
+        .unwrap();
+
+        let signature = EvmSignature::new(crypto_hash, &signer);
+        let js_signature = EvmSignature::from_str("0xe257048813b851f812ba6e508e972d8bb09504824692b027ca95d31301dbe8c7103a2f35ce9950d031d260f412dcba09c24027288872a67abe261c0a3e55c9121b").unwrap();
+        assert_eq!(signature, js_signature);
+    }
+
+    #[test]
     fn test_signatures() {
         use serde::{Deserialize, Serialize};
 
         use crate::crypto::{
             secp256k1::evm::{EvmKeyPair, EvmSignature},
-            BcsSignable, TestString,
+            BcsSignable, CryptoHash, TestString,
         };
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -551,14 +629,15 @@ mod tests {
         let keypair2 = EvmKeyPair::generate();
 
         let ts = TestString("hello".into());
+        let ts_cryptohash = CryptoHash::new(&ts);
         let tsx = TestString("hellox".into());
         let foo = Foo("hello".into());
 
-        let s = EvmSignature::new(&ts, &keypair1.secret_key);
-        assert!(s.check(&ts, &keypair1.public_key).is_ok());
-        assert!(s.check(&ts, &keypair2.public_key).is_err());
-        assert!(s.check(&tsx, &keypair1.public_key).is_err());
-        assert!(s.check(&foo, &keypair1.public_key).is_err());
+        let s = EvmSignature::new(ts_cryptohash, &keypair1.secret_key);
+        assert!(s.check(&ts, keypair1.public_key).is_ok());
+        assert!(s.check(&ts, keypair2.public_key).is_err());
+        assert!(s.check(&tsx, keypair1.public_key).is_err());
+        assert!(s.check(&foo, keypair1.public_key).is_err());
     }
 
     #[test]
@@ -587,10 +666,11 @@ mod tests {
     fn test_signature_serialization() {
         use crate::crypto::{
             secp256k1::evm::{EvmKeyPair, EvmSignature},
-            TestString,
+            CryptoHash, TestString,
         };
         let keypair = EvmKeyPair::generate();
-        let sig = EvmSignature::new(&TestString("hello".into()), &keypair.secret_key);
+        let prehash = CryptoHash::new(&TestString("hello".into()));
+        let sig = EvmSignature::new(prehash, &keypair.secret_key);
         let s = serde_json::to_string(&sig).unwrap();
         let sig2: EvmSignature = serde_json::from_str(&s).unwrap();
         assert_eq!(sig, sig2);
@@ -628,12 +708,31 @@ mod tests {
     fn human_readable_ser() {
         use crate::crypto::{
             secp256k1::evm::{EvmKeyPair, EvmSignature},
-            TestString,
+            CryptoHash, TestString,
         };
         let key_pair = EvmKeyPair::generate();
-        let sig = EvmSignature::new(&TestString("hello".into()), &key_pair.secret_key);
+        let prehash = CryptoHash::new(&TestString("hello".into()));
+        let sig = EvmSignature::new(prehash, &key_pair.secret_key);
         let s = serde_json::to_string(&sig).unwrap();
         let sig2: EvmSignature = serde_json::from_str(&s).unwrap();
         assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn public_key_recovery() {
+        use crate::crypto::{
+            secp256k1::evm::{EvmKeyPair, EvmPublicKey, EvmSignature},
+            CryptoHash, TestString,
+        };
+        let key_pair = EvmKeyPair::generate();
+        let address = key_pair.public_key.address();
+        let msg = TestString("hello".into());
+        let prehash = CryptoHash::new(&msg);
+        let sig = EvmSignature::new(prehash, &key_pair.secret_key);
+
+        sig.check_with_recover(&msg, address.0 .0).unwrap();
+
+        let public_key = EvmPublicKey::recover_from_msg(&sig, &msg).unwrap();
+        assert_eq!(public_key, key_pair.public_key);
     }
 }

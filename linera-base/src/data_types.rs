@@ -13,6 +13,7 @@ use std::{
     hash::Hash,
     io, iter,
     num::ParseIntError,
+    ops::{Bound, RangeBounds},
     path::Path,
     str::FromStr,
 };
@@ -486,6 +487,32 @@ impl TryFrom<BlockHeight> for usize {
     }
 }
 
+/// Allows converting [`BlockHeight`] ranges to inclusive tuples of bounds.
+pub trait BlockHeightRangeBounds {
+    /// Returns the range as a tuple of inclusive bounds.
+    /// If the range is empty, returns `None`.
+    fn to_inclusive(&self) -> Option<(BlockHeight, BlockHeight)>;
+}
+
+impl<T: RangeBounds<BlockHeight>> BlockHeightRangeBounds for T {
+    fn to_inclusive(&self) -> Option<(BlockHeight, BlockHeight)> {
+        let start = match self.start_bound() {
+            Bound::Included(height) => *height,
+            Bound::Excluded(height) => height.try_add_one().ok()?,
+            Bound::Unbounded => BlockHeight(0),
+        };
+        let end = match self.end_bound() {
+            Bound::Included(height) => *height,
+            Bound::Excluded(height) => height.try_sub_one().ok()?,
+            Bound::Unbounded => BlockHeight::MAX,
+        };
+        if start > end {
+            return None;
+        }
+        Some((start, end))
+    }
+}
+
 impl_wrapped_number!(Amount, u128);
 impl_wrapped_number!(BlockHeight, u64);
 impl_wrapped_number!(TimeDelta, u64);
@@ -782,6 +809,13 @@ impl Epoch {
     #[inline]
     pub fn try_add_one(self) -> Result<Self, ArithmeticError> {
         let val = self.0.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+        Ok(Self(val))
+    }
+
+    /// Tries to return an epoch with a number decreased by one. Returns an error if an underflow
+    /// happens.
+    pub fn try_sub_one(self) -> Result<Self, ArithmeticError> {
+        let val = self.0.checked_sub(1).ok_or(ArithmeticError::Underflow)?;
         Ok(Self(val))
     }
 
