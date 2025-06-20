@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ops::RangeBounds,
     sync::Arc,
 };
 
@@ -10,24 +11,24 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{
-        Amount, ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
-        Epoch, OracleResponse, Timestamp,
+        ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
+        BlockHeightRangeBounds as _, Epoch, OracleResponse, Timestamp,
     },
     ensure,
-    identifiers::{AccountOwner, ApplicationId, BlobType, ChainId, MessageId},
+    identifiers::{AccountOwner, ApplicationId, BlobType, ChainId},
     ownership::ChainOwnership,
 };
 use linera_execution::{
-    committee::Committee, ExecutionRuntimeContext, ExecutionStateView, Message, MessageContext,
-    Operation, OperationContext, OutgoingMessage, Query, QueryContext, QueryOutcome,
-    ResourceController, ResourceTracker, ServiceRuntimeEndpoint, TransactionTracker,
+    committee::Committee, ExecutionRuntimeContext, ExecutionStateView, Message, Operation,
+    OutgoingMessage, Query, QueryContext, QueryOutcome, ResourceController, ResourceTracker,
+    ServiceRuntimeEndpoint, TransactionTracker,
 };
 use linera_views::{
     bucket_queue_view::BucketQueueView,
     context::Context,
     log_view::LogView,
     map_view::MapView,
-    reentrant_collection_view::ReentrantCollectionView,
+    reentrant_collection_view::{ReadGuardedView, ReentrantCollectionView},
     register_view::RegisterView,
     set_view::SetView,
     store::ReadableKeyValueStore as _,
@@ -39,8 +40,7 @@ use crate::{
     block::{Block, ConfirmedBlock},
     block_tracker::BlockExecutionTracker,
     data_types::{
-        BlockExecutionOutcome, ChainAndHeight, IncomingBundle, MessageAction, MessageBundle,
-        PostedMessage, ProposedBlock, Transaction,
+        BlockExecutionOutcome, ChainAndHeight, IncomingBundle, MessageBundle, ProposedBlock,
     },
     inbox::{Cursor, InboxError, InboxStateView},
     manager::ChainManager,
@@ -277,6 +277,11 @@ where
     /// Number of outgoing messages in flight for each block height.
     /// We use a `RegisterView` to prioritize speed for small maps.
     pub outbox_counters: RegisterView<C, BTreeMap<BlockHeight, u32>>,
+    /// Outboxes with at least one pending message. This allows us to avoid loading all outboxes.
+    pub nonempty_outboxes: RegisterView<C, BTreeSet<ChainId>>,
+
+    /// Blocks that have been verified but not executed yet, and that may not be contiguous.
+    pub preprocessed_blocks: MapView<C, BlockHeight, CryptoHash>,
 }
 
 /// Block-chaining state.
@@ -410,17 +415,21 @@ where
                 .outbox_counters
                 .get_mut()
                 .get_mut(&update)
-                .expect("message counter should be present");
-            *counter = counter
-                .checked_sub(1)
-                .expect("message counter should not underflow");
+                .ok_or_else(|| {
+                    ChainError::InternalError("message counter should be present".into())
+                })?;
+            *counter = counter.checked_sub(1).ok_or(ArithmeticError::Underflow)?;
             if *counter == 0 {
                 // Important for the test in `all_messages_delivered_up_to`.
                 self.outbox_counters.get_mut().remove(&update);
             }
         }
         if outbox.queue.count() == 0 {
-            self.outboxes.remove_entry(target)?;
+            self.nonempty_outboxes.get_mut().remove(target);
+            // If the outbox is empty and not ahead of the executed blocks, remove it.
+            if *outbox.next_height_to_schedule.get() <= self.tip_state.get().next_block_height {
+                self.outboxes.remove_entry(target)?;
+            }
         }
         #[cfg(with_metrics)]
         metrics::NUM_OUTBOXES
@@ -695,6 +704,21 @@ where
         Ok(())
     }
 
+    /// Returns the chain IDs of all recipients for which a message is waiting in the outbox.
+    pub fn nonempty_outbox_chain_ids(&self) -> Vec<ChainId> {
+        self.nonempty_outboxes.get().iter().copied().collect()
+    }
+
+    /// Returns the outboxes for the given targets, or an error if any of them are missing.
+    pub async fn load_outboxes(
+        &self,
+        targets: &[ChainId],
+    ) -> Result<Vec<ReadGuardedView<OutboxStateView<C>>>, ChainError> {
+        let vec_of_options = self.outboxes.try_load_entries(targets).await?;
+        let optional_vec = vec_of_options.into_iter().collect::<Option<Vec<_>>>();
+        optional_vec.ok_or_else(|| ChainError::InternalError("Missing outboxes".into()))
+    }
+
     /// Executes a block: first the incoming messages, then the main operation.
     /// Does not update chain state other than the execution state.
     #[expect(clippy::too_many_arguments)]
@@ -749,69 +773,8 @@ where
         )?;
 
         for transaction in block.transactions() {
-            let chain_execution_context =
-                block_execution_tracker.chain_execution_context(&transaction);
-            let mut txn_tracker = block_execution_tracker.new_transaction_tracker()?;
-            match transaction {
-                Transaction::ReceiveMessages(incoming_bundle) => {
-                    block_execution_tracker
-                        .resource_controller_mut()
-                        .track_block_size_of(&incoming_bundle)
-                        .with_execution_context(chain_execution_context)?;
-                    for (message_id, posted_message) in incoming_bundle.messages_and_ids() {
-                        Box::pin(Self::execute_message_in_block(
-                            chain,
-                            message_id,
-                            posted_message,
-                            incoming_bundle,
-                            block,
-                            round,
-                            &mut txn_tracker,
-                            block_execution_tracker.resource_controller_mut(),
-                        ))
-                        .await?;
-                    }
-                }
-                Transaction::ExecuteOperation(operation) => {
-                    block_execution_tracker
-                        .resource_controller_mut()
-                        .with_state(&mut chain.system)
-                        .await?
-                        .track_block_size_of(&operation)
-                        .with_execution_context(chain_execution_context)?;
-                    #[cfg(with_metrics)]
-                    let _operation_latency = metrics::OPERATION_EXECUTION_LATENCY.measure_latency();
-                    let context = OperationContext {
-                        chain_id: block.chain_id,
-                        height: block.height,
-                        round,
-                        authenticated_signer: block.authenticated_signer,
-                        authenticated_caller_id: None,
-                        timestamp: block.timestamp,
-                    };
-                    Box::pin(chain.execute_operation(
-                        context,
-                        operation.clone(),
-                        &mut txn_tracker,
-                        block_execution_tracker.resource_controller_mut(),
-                    ))
-                    .await
-                    .with_execution_context(chain_execution_context)?;
-                    block_execution_tracker
-                        .resource_controller_mut()
-                        .with_state(&mut chain.system)
-                        .await?
-                        .track_operation(operation)
-                        .with_execution_context(chain_execution_context)?;
-                }
-            }
-
-            let txn_outcome = txn_tracker
-                .into_outcome()
-                .with_execution_context(chain_execution_context)?;
-
             block_execution_tracker
-                .process_txn_outcome(&txn_outcome, &mut chain.system, chain_execution_context)
+                .execute_transaction(transaction, round, chain)
                 .await?;
         }
 
@@ -942,81 +905,20 @@ where
             &block.body.messages,
         )?;
         self.confirmed_log.push(hash);
+        self.preprocessed_blocks.remove(&block.header.height)?;
         Ok(())
     }
 
-    /// Executes a message as part of an incoming bundle in a block.
-    #[expect(clippy::too_many_arguments)]
-    async fn execute_message_in_block(
-        chain: &mut ExecutionStateView<C>,
-        message_id: MessageId,
-        posted_message: &PostedMessage,
-        incoming_bundle: &IncomingBundle,
-        block: &ProposedBlock,
-        round: Option<u32>,
-        txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<AccountOwner>>,
-    ) -> Result<(), ChainError> {
-        #[cfg(with_metrics)]
-        let _message_latency = metrics::MESSAGE_EXECUTION_LATENCY.measure_latency();
-        let context = MessageContext {
-            chain_id: block.chain_id,
-            is_bouncing: posted_message.is_bouncing(),
-            height: block.height,
-            round,
-            message_id,
-            authenticated_signer: posted_message.authenticated_signer,
-            refund_grant_to: posted_message.refund_grant_to,
-            timestamp: block.timestamp,
-        };
-        let mut grant = posted_message.grant;
-        match incoming_bundle.action {
-            MessageAction::Accept => {
-                let chain_execution_context =
-                    ChainExecutionContext::IncomingBundle(txn_tracker.transaction_index());
-                // Once a chain is closed, accepting incoming messages is not allowed.
-                ensure!(!chain.system.closed.get(), ChainError::ClosedChain);
-
-                Box::pin(chain.execute_message(
-                    context,
-                    posted_message.message.clone(),
-                    (grant > Amount::ZERO).then_some(&mut grant),
-                    txn_tracker,
-                    resource_controller,
-                ))
-                .await
-                .with_execution_context(chain_execution_context)?;
-                chain
-                    .send_refund(context, grant, txn_tracker)
-                    .await
-                    .with_execution_context(chain_execution_context)?;
-            }
-            MessageAction::Reject => {
-                // If rejecting a message fails, the entire block proposal should be
-                // scrapped.
-                ensure!(
-                    !posted_message.is_protected() || *chain.system.closed.get(),
-                    ChainError::CannotRejectMessage {
-                        chain_id: block.chain_id,
-                        origin: incoming_bundle.origin,
-                        posted_message: Box::new(posted_message.clone()),
-                    }
-                );
-                if posted_message.is_tracked() {
-                    // Bounce the message.
-                    chain
-                        .bounce_message(context, grant, posted_message.message.clone(), txn_tracker)
-                        .await
-                        .with_execution_context(ChainExecutionContext::Block)?;
-                } else {
-                    // Nothing to do except maybe refund the grant.
-                    chain
-                        .send_refund(context, grant, txn_tracker)
-                        .await
-                        .with_execution_context(ChainExecutionContext::Block)?;
-                }
-            }
+    /// Adds a block to `preprocessed_blocks`, and updates the outboxes where possible.
+    pub async fn preprocess_block(&mut self, block: &ConfirmedBlock) -> Result<(), ChainError> {
+        let hash = block.inner().hash();
+        let block = block.inner().inner();
+        let height = block.header.height;
+        if height < self.tip_state.get().next_block_height {
+            return Ok(());
         }
+        self.process_outgoing_messages(block).await?;
+        self.preprocessed_blocks.insert(&height, hash)?;
         Ok(())
     }
 
@@ -1067,6 +969,39 @@ where
         Ok(())
     }
 
+    /// Returns the hashes of all blocks in the given range. Returns an error if we are missing
+    /// any of those blocks.
+    pub async fn block_hashes(
+        &self,
+        range: impl RangeBounds<BlockHeight>,
+    ) -> Result<Vec<CryptoHash>, ChainError> {
+        let next_height = self.tip_state.get().next_block_height;
+        // If the range is not empty, it can always be represented as start..=end.
+        let Some((start, end)) = range.to_inclusive() else {
+            return Ok(Vec::new());
+        };
+        // Everything up to (excluding) next_height is in confirmed_log.
+        let mut hashes = if let Ok(last_height) = next_height.try_sub_one() {
+            let usize_start = usize::try_from(start)?;
+            let usize_end = usize::try_from(end.min(last_height))?;
+            self.confirmed_log.read(usize_start..=usize_end).await?
+        } else {
+            Vec::new()
+        };
+        // Everything after (including) next_height in in preprocessed_blocks if we have it.
+        for height in start.max(next_height).0..=end.0 {
+            hashes.push(
+                self.preprocessed_blocks
+                    .get(&BlockHeight(height))
+                    .await?
+                    .ok_or_else(|| {
+                        ChainError::InternalError("missing entry in preprocessed_blocks".into())
+                    })?,
+            );
+        }
+        Ok(hashes)
+    }
+
     /// Resets the chain manager for the next block height.
     fn reset_chain_manager(
         &mut self,
@@ -1094,14 +1029,42 @@ where
         // application.
         let recipients = block.recipients();
         let block_height = block.header.height;
+        let next_height = self.tip_state.get().next_block_height;
 
         // Update the outboxes.
         let outbox_counters = self.outbox_counters.get_mut();
+        let nonempty_outboxes = self.nonempty_outboxes.get_mut();
         let targets = recipients.into_iter().collect::<Vec<_>>();
         let outboxes = self.outboxes.try_load_entries_mut(&targets).await?;
-        for mut outbox in outboxes {
+        for (mut outbox, target) in outboxes.into_iter().zip(&targets) {
+            if block_height > next_height {
+                // There may be a gap in the chain before this block. We can only add it to this
+                // outbox if the previous message to the same recipient has already been added.
+                let prev_hash = match outbox.next_height_to_schedule.get().try_sub_one().ok() {
+                    // The block with the last added message has already been executed; look up its
+                    // hash in the confirmed_log.
+                    Some(height) if height < next_height => {
+                        let index =
+                            usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                        Some(self.confirmed_log.get(index).await?.ok_or_else(|| {
+                            ChainError::InternalError("missing entry in confirmed_log".into())
+                        })?)
+                    }
+                    // The block with last added message has not been executed yet. If we have it,
+                    // it's in preprocessed_blocks.
+                    Some(height) => Some(self.preprocessed_blocks.get(&height).await?.ok_or_else(
+                        || ChainError::InternalError("missing entry in preprocessed_blocks".into()),
+                    )?),
+                    None => None, // No message to that sender was added yet.
+                };
+                // Only schedule if this block contains the next message for that recipient.
+                if prev_hash.as_ref() != block.body.previous_message_blocks.get(target) {
+                    continue;
+                }
+            }
             if outbox.schedule_message(block_height)? {
                 *outbox_counters.entry(block_height).or_default() += 1;
+                nonempty_outboxes.insert(*target);
             }
         }
 

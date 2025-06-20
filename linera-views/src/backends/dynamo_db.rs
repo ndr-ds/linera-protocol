@@ -16,10 +16,8 @@ use async_lock::{Semaphore, SemaphoreGuard};
 use aws_sdk_dynamodb::{
     error::SdkError,
     operation::{
-        batch_write_item::BatchWriteItemError,
         create_table::CreateTableError,
         delete_table::DeleteTableError,
-        describe_table::DescribeTableError,
         get_item::GetItemError,
         list_tables::ListTablesError,
         query::{QueryError, QueryOutput},
@@ -48,8 +46,8 @@ use crate::{
     journaling::{DirectWritableKeyValueStore, JournalConsistencyError, JournalingKeyValueStore},
     lru_caching::{LruCachingConfig, LruCachingStore},
     store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, KeyIterable, KeyValueIterable,
-        KeyValueStoreError, ReadableKeyValueStore, WithError,
+        AdminKeyValueStore, KeyIterable, KeyValueIterable, KeyValueStoreError,
+        ReadableKeyValueStore, WithError,
     },
     value_splitting::{ValueSplittingError, ValueSplittingStore},
     FutureSyncExt as _,
@@ -322,9 +320,11 @@ pub struct DynamoDbStoreInternal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoDbStoreInternalConfig {
     /// Whether to use DynamoDB local or not.
-    use_dynamodb_local: bool,
-    /// The common configuration of the key value store
-    common_config: CommonStoreInternalConfig,
+    pub use_dynamodb_local: bool,
+    /// Maximum number of concurrent database queries allowed for this client.
+    pub max_concurrent_queries: Option<usize>,
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
 impl DynamoDbStoreInternalConfig {
@@ -352,10 +352,9 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
         Self::check_namespace(namespace)?;
         let client = config.client().await?;
         let semaphore = config
-            .common_config
             .max_concurrent_queries
             .map(|n| Arc::new(Semaphore::new(n)));
-        let max_stream_queries = config.common_config.max_stream_queries;
+        let max_stream_queries = config.max_stream_queries;
         let namespace = namespace.to_string();
         let start_key = extend_root_key(&[]);
         let store = Self {
@@ -1007,10 +1006,6 @@ pub enum DynamoDbStoreInternalError {
     #[error(transparent)]
     Get(#[from] Box<SdkError<GetItemError>>),
 
-    /// An error occurred while writing a batch of items.
-    #[error(transparent)]
-    BatchWriteItem(#[from] Box<SdkError<BatchWriteItemError>>),
-
     /// An error occurred while writing a transaction of items.
     #[error(transparent)]
     TransactWriteItem(#[from] Box<SdkError<TransactWriteItemsError>>),
@@ -1026,10 +1021,6 @@ pub enum DynamoDbStoreInternalError {
     /// An error occurred while listing tables
     #[error(transparent)]
     ListTables(#[from] Box<SdkError<ListTablesError>>),
-
-    /// An error occurred while describing tables
-    #[error(transparent)]
-    DescribeTables(#[from] Box<SdkError<DescribeTableError>>),
 
     /// The transact maximum size is `MAX_TRANSACT_WRITE_ITEM_SIZE`.
     #[error("The transact must have length at most MAX_TRANSACT_WRITE_ITEM_SIZE")]
@@ -1050,10 +1041,6 @@ pub enum DynamoDbStoreInternalError {
     /// Key prefixes have to be of non-zero length.
     #[error("The key_prefix must be of strictly positive length")]
     ZeroLengthKeyPrefix,
-
-    /// The recovery failed.
-    #[error("The DynamoDB database recovery failed")]
-    DatabaseRecoveryFailed,
 
     /// The journal is not coherent
     #[error(transparent)]
@@ -1155,14 +1142,10 @@ impl KeyValueStoreError for DynamoDbStoreInternalError {
 #[cfg(with_testing)]
 impl TestKeyValueStore for JournalingKeyValueStore<DynamoDbStoreInternal> {
     async fn new_test_config() -> Result<DynamoDbStoreInternalConfig, DynamoDbStoreInternalError> {
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: Some(TEST_DYNAMO_DB_MAX_CONCURRENT_QUERIES),
-            max_stream_queries: TEST_DYNAMO_DB_MAX_STREAM_QUERIES,
-            replication_factor: 1,
-        };
         Ok(DynamoDbStoreInternalConfig {
             use_dynamodb_local: true,
-            common_config,
+            max_concurrent_queries: Some(TEST_DYNAMO_DB_MAX_CONCURRENT_QUERIES),
+            max_stream_queries: TEST_DYNAMO_DB_MAX_STREAM_QUERIES,
         })
     }
 }
@@ -1187,23 +1170,6 @@ pub type DynamoDbStoreError = ValueSplittingError<DynamoDbStoreInternalError>;
 
 /// The config type for [`DynamoDbStore`]`
 pub type DynamoDbStoreConfig = LruCachingConfig<DynamoDbStoreInternalConfig>;
-
-impl DynamoDbStoreConfig {
-    /// Creates a `DynamoDbStoreConfig` from the input.
-    pub fn new(
-        use_dynamodb_local: bool,
-        common_config: crate::store::CommonStoreConfig,
-    ) -> DynamoDbStoreConfig {
-        let inner_config = DynamoDbStoreInternalConfig {
-            use_dynamodb_local,
-            common_config: common_config.reduced(),
-        };
-        DynamoDbStoreConfig {
-            inner_config,
-            storage_cache_config: common_config.storage_cache_config,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

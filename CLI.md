@@ -22,7 +22,7 @@ This document contains the help content for the `linera` command-line program.
 * [`linera sync-validator`↴](#linera-sync-validator)
 * [`linera set-validator`↴](#linera-set-validator)
 * [`linera remove-validator`↴](#linera-remove-validator)
-* [`linera finalize-committee`↴](#linera-finalize-committee)
+* [`linera revoke-epochs`↴](#linera-revoke-epochs)
 * [`linera resource-control-policy`↴](#linera-resource-control-policy)
 * [`linera create-genesis-config`↴](#linera-create-genesis-config)
 * [`linera watch`↴](#linera-watch)
@@ -86,7 +86,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `sync-validator` — Synchronizes a validator with the local state of chains
 * `set-validator` — Add or modify a validator (admin only)
 * `remove-validator` — Remove a validator (admin only)
-* `finalize-committee` — Deprecates all committees except the last one
+* `revoke-epochs` — Deprecates all committees up to and including the specified one
 * `resource-control-policy` — View or update the resource control policy
 * `create-genesis-config` — Create genesis configuration for a Linera deployment. Create initial user chains and print information to be used for initialization of validator setup. This will also create an initial wallet for the owner of the initial "root" chains
 * `watch` — Watch the network for notifications
@@ -108,7 +108,6 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 
 ###### **Options:**
 
-* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
 * `--wallet <WALLET_STATE_PATH>` — Sets the file storing the private state of user chains (an empty one will be created if missing)
 * `--keystore <KEYSTORE_PATH>` — Sets the file storing the keystore state
 * `-w`, `--with-wallet <WITH_WALLET>` — Given an ASCII alphanumeric parameter `X`, read the wallet state and the wallet storage config from the environment variables `LINERA_WALLET_{X}` and `LINERA_STORAGE_{X}` instead of `LINERA_WALLET` and `LINERA_STORAGE`
@@ -151,25 +150,26 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--blob-download-timeout-ms <BLOB_DOWNLOAD_TIMEOUT>` — The delay when downloading a blob, after which we try a second validator, in milliseconds
 
   Default value: `1000`
-* `--max-concurrent-queries <MAX_CONCURRENT_QUERIES>` — The maximal number of simultaneous queries to the database
-* `--max-stream-queries <MAX_STREAM_QUERIES>` — The maximal number of simultaneous stream queries to the database
+* `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
+* `--storage-max-concurrent-queries <STORAGE_MAX_CONCURRENT_QUERIES>` — The maximal number of simultaneous queries to the database
+* `--storage-max-stream-queries <STORAGE_MAX_STREAM_QUERIES>` — The maximal number of simultaneous stream queries to the database
 
   Default value: `10`
-* `--max-cache-size <MAX_CACHE_SIZE>` — The maximal memory used in the storage cache
+* `--storage-max-cache-size <STORAGE_MAX_CACHE_SIZE>` — The maximal memory used in the storage cache
 
   Default value: `10000000`
-* `--max-entry-size <MAX_ENTRY_SIZE>` — The maximal size of an entry in the storage cache
+* `--storage-max-entry-size <STORAGE_MAX_ENTRY_SIZE>` — The maximal size of an entry in the storage cache
 
   Default value: `1000000`
-* `--max-cache-entries <MAX_CACHE_ENTRIES>` — The maximal number of entries in the storage cache
+* `--storage-max-cache-entries <STORAGE_MAX_CACHE_ENTRIES>` — The maximal number of entries in the storage cache
 
   Default value: `1000`
-* `--wasm-runtime <WASM_RUNTIME>` — The WebAssembly runtime to use
-* `--tokio-threads <TOKIO_THREADS>` — The number of Tokio worker threads to use
-* `--tokio-blocking-threads <TOKIO_BLOCKING_THREADS>` — The number of Tokio blocking threads to use
 * `--storage-replication-factor <STORAGE_REPLICATION_FACTOR>` — The replication factor for the keyspace
 
   Default value: `1`
+* `--wasm-runtime <WASM_RUNTIME>` — The WebAssembly runtime to use
+* `--tokio-threads <TOKIO_THREADS>` — The number of Tokio worker threads to use
+* `--tokio-blocking-threads <TOKIO_BLOCKING_THREADS>` — The number of Tokio blocking threads to use
 
 
 
@@ -461,11 +461,15 @@ Remove a validator (admin only)
 
 
 
-## `linera finalize-committee`
+## `linera revoke-epochs`
 
-Deprecates all committees except the last one
+Deprecates all committees up to and including the specified one
 
-**Usage:** `linera finalize-committee`
+**Usage:** `linera revoke-epochs <EPOCH>`
+
+###### **Arguments:**
+
+* `<EPOCH>`
 
 
 

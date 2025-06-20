@@ -964,10 +964,11 @@ impl ClientWrapper {
         Ok(())
     }
 
-    pub async fn finalize_committee(&self) -> Result<()> {
+    pub async fn revoke_epochs(&self, epoch: Epoch) -> Result<()> {
         self.command()
             .await?
-            .arg("finalize-committee")
+            .arg("revoke-epochs")
+            .arg(epoch.to_string())
             .spawn_and_wait_for_stdout()
             .await?;
         Ok(())
@@ -1003,7 +1004,7 @@ impl ClientWrapper {
     }
 
     /// Runs `linera set-preferred-owner` for `chain_id`.
-    pub async fn set_preffered_owner(
+    pub async fn set_preferred_owner(
         &self,
         chain_id: ChainId,
         owner: Option<AccountOwner>,

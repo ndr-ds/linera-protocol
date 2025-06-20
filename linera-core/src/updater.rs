@@ -7,7 +7,6 @@ use std::{
     fmt,
     hash::Hash,
     mem,
-    ops::Range,
 };
 
 use futures::{stream, stream::TryStreamExt, Future, StreamExt};
@@ -21,7 +20,7 @@ use linera_chain::{
     types::{ConfirmedBlock, GenericCertificate, ValidatedBlock, ValidatedBlockCertificate},
 };
 use linera_execution::committee::Committee;
-use linera_storage::Storage;
+use linera_storage::{ResultReadCertificates, Storage};
 use thiserror::Error;
 
 use crate::{
@@ -354,21 +353,27 @@ where
         let remote_info = self.remote_node.handle_chain_info_query(query).await?;
         let initial_block_height = remote_info.next_block_height;
         // Obtain the missing blocks and the manager state from the local node.
-        let range: Range<usize> =
-            initial_block_height.try_into()?..target_block_height.try_into()?;
+        let range = initial_block_height..target_block_height;
         let (keys, timeout) = {
             let chain = self.local_node.chain_state_view(chain_id).await?;
             (
-                chain.confirmed_log.read(range).await?,
+                chain.block_hashes(range).await?,
                 chain.manager.timeout.get().clone(),
             )
         };
         if !keys.is_empty() {
             // Send the requested certificates in order.
             let storage = self.local_node.storage_client();
-            let certs = storage.read_certificates(keys.into_iter()).await?;
-            for cert in certs {
-                self.send_confirmed_certificate(cert, delivery).await?;
+            let certificates = storage.read_certificates(keys.clone()).await?;
+            let certificates = match ResultReadCertificates::new(certificates, keys) {
+                ResultReadCertificates::Certificates(certificates) => certificates,
+                ResultReadCertificates::InvalidHashes(hashes) => {
+                    return Err(ChainClientError::ReadCertificatesError(hashes))
+                }
+            };
+            for certificate in certificates {
+                self.send_confirmed_certificate(certificate, delivery)
+                    .await?;
             }
         }
         if let Some(cert) = timeout {

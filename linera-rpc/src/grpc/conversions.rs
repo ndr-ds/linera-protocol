@@ -148,6 +148,7 @@ impl From<NetworkDescription> for api::NetworkDescription {
             name,
             genesis_config_hash,
             genesis_timestamp,
+            genesis_committee_blob_hash,
             admin_chain_id,
         }: NetworkDescription,
     ) -> Self {
@@ -156,6 +157,7 @@ impl From<NetworkDescription> for api::NetworkDescription {
             genesis_config_hash: Some(genesis_config_hash.into()),
             genesis_timestamp: genesis_timestamp.micros(),
             admin_chain_id: Some(admin_chain_id.into()),
+            genesis_committee_blob_hash: Some(genesis_committee_blob_hash.into()),
         }
     }
 }
@@ -168,6 +170,7 @@ impl TryFrom<api::NetworkDescription> for NetworkDescription {
             name,
             genesis_config_hash,
             genesis_timestamp,
+            genesis_committee_blob_hash,
             admin_chain_id,
         }: api::NetworkDescription,
     ) -> Result<Self, Self::Error> {
@@ -176,6 +179,7 @@ impl TryFrom<api::NetworkDescription> for NetworkDescription {
             genesis_config_hash: try_proto_convert(genesis_config_hash)?,
             genesis_timestamp: genesis_timestamp.into(),
             admin_chain_id: try_proto_convert(admin_chain_id)?,
+            genesis_committee_blob_hash: try_proto_convert(genesis_committee_blob_hash)?,
         })
     }
 }
@@ -235,8 +239,7 @@ impl TryFrom<BlockProposal> for api::BlockProposal {
         Ok(Self {
             chain_id: Some(block_proposal.content.block.chain_id.into()),
             content: bincode::serialize(&block_proposal.content)?,
-            public_key: Some(block_proposal.public_key.into()),
-            owner: Some(AccountOwner::from(block_proposal.public_key).try_into()?),
+            owner: Some(block_proposal.owner().try_into()?),
             signature: Some(block_proposal.signature.into()),
             original_proposal: block_proposal
                 .original_proposal
@@ -257,7 +260,6 @@ impl TryFrom<api::BlockProposal> for BlockProposal {
         );
         Ok(Self {
             content,
-            public_key: try_proto_convert(block_proposal.public_key)?,
             signature: try_proto_convert(block_proposal.signature)?,
             original_proposal: block_proposal
                 .original_proposal
@@ -1257,7 +1259,6 @@ pub mod tests {
                 round: Round::SingleLeader(4),
                 outcome: Some(outcome),
             },
-            public_key: key_pair.public(),
             signature: key_pair.sign(&Foo("test".into())),
             original_proposal: Some(OriginalProposal::Regular { certificate }),
         };

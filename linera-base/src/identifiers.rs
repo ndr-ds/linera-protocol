@@ -38,6 +38,7 @@ pub enum AccountOwner {
     /// 32-byte account address.
     Address32(CryptoHash),
     /// 20-byte account EVM-compatible address.
+    #[debug(with = "hex_debug")]
     Address20([u8; 20]),
 }
 
@@ -1107,7 +1108,7 @@ mod tests {
             epoch: Epoch::ZERO,
             ownership: ChainOwnership::single(AccountOwner::Reserved(0)),
             balance: Amount::ZERO,
-            committees: [(Epoch::ZERO, vec![])].into_iter().collect(),
+            active_epochs: [Epoch::ZERO].into_iter().collect(),
             application_permissions: Default::default(),
         };
         let description = ChainDescription::new(
@@ -1117,7 +1118,7 @@ mod tests {
         );
         assert_eq!(
             description.id().to_string(),
-            "4423610c1010c31be88bc6cc041a9c1063d58062e9d748c1552a1e75e7ea13a9"
+            "24774c4de89d4684745509eedc75f48fd11958c7fd202ca96240bf616212cc73"
         );
     }
 

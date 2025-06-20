@@ -7,12 +7,13 @@
 #[cfg(with_testing)]
 use std::ops;
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     fmt::{self, Display},
     fs,
     hash::Hash,
     io, iter,
     num::ParseIntError,
+    ops::{Bound, RangeBounds},
     path::Path,
     str::FromStr,
 };
@@ -486,6 +487,32 @@ impl TryFrom<BlockHeight> for usize {
     }
 }
 
+/// Allows converting [`BlockHeight`] ranges to inclusive tuples of bounds.
+pub trait BlockHeightRangeBounds {
+    /// Returns the range as a tuple of inclusive bounds.
+    /// If the range is empty, returns `None`.
+    fn to_inclusive(&self) -> Option<(BlockHeight, BlockHeight)>;
+}
+
+impl<T: RangeBounds<BlockHeight>> BlockHeightRangeBounds for T {
+    fn to_inclusive(&self) -> Option<(BlockHeight, BlockHeight)> {
+        let start = match self.start_bound() {
+            Bound::Included(height) => *height,
+            Bound::Excluded(height) => height.try_add_one().ok()?,
+            Bound::Unbounded => BlockHeight(0),
+        };
+        let end = match self.end_bound() {
+            Bound::Included(height) => *height,
+            Bound::Excluded(height) => height.try_sub_one().ok()?,
+            Bound::Unbounded => BlockHeight::MAX,
+        };
+        if start > end {
+            return None;
+        }
+        Some((start, end))
+    }
+}
+
 impl_wrapped_number!(Amount, u128);
 impl_wrapped_number!(BlockHeight, u64);
 impl_wrapped_number!(TimeDelta, u64);
@@ -785,6 +812,13 @@ impl Epoch {
         Ok(Self(val))
     }
 
+    /// Tries to return an epoch with a number decreased by one. Returns an error if an underflow
+    /// happens.
+    pub fn try_sub_one(self) -> Result<Self, ArithmeticError> {
+        let val = self.0.checked_sub(1).ok_or(ArithmeticError::Underflow)?;
+        Ok(Self(val))
+    }
+
     /// Tries to add one to this epoch's number. Returns an error if an overflow happens.
     #[inline]
     pub fn try_add_assign_one(&mut self) -> Result<(), ArithmeticError> {
@@ -800,8 +834,8 @@ pub struct InitialChainConfig {
     pub ownership: ChainOwnership,
     /// The epoch in which the chain is created.
     pub epoch: Epoch,
-    /// Serialized committees corresponding to epochs.
-    pub committees: BTreeMap<Epoch, Vec<u8>>,
+    /// Set of epochs active at the time of creation of the chain.
+    pub active_epochs: BTreeSet<Epoch>,
     /// The initial chain balance.
     pub balance: Amount,
     /// The initial application permissions.
@@ -863,6 +897,8 @@ pub struct NetworkDescription {
     pub genesis_config_hash: CryptoHash,
     /// Genesis timestamp.
     pub genesis_timestamp: Timestamp,
+    /// Hash of the blob containing the genesis committee.
+    pub genesis_committee_blob_hash: CryptoHash,
     /// The chain ID of the admin chain.
     pub admin_chain_id: ChainId,
 }

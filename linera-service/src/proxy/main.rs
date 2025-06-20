@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use futures::{FutureExt as _, SinkExt, StreamExt};
 use linera_base::listen_for_shutdown_signals;
-use linera_client::config::{GenesisConfig, ValidatorServerConfig};
+use linera_client::config::ValidatorServerConfig;
 use linera_core::{node::NodeError, JoinSetExt as _};
 use linera_rpc::{
     config::{
@@ -23,11 +23,10 @@ use linera_sdk::linera_base_types::Blob;
 #[cfg(with_metrics)]
 use linera_service::prometheus_server;
 use linera_service::{
-    storage::{Runnable, StorageConfigNamespace},
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
-use linera_storage::Storage;
-use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
+use linera_storage::{ResultReadCertificates, Storage};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
@@ -70,35 +69,11 @@ pub struct ProxyOptions {
 
     /// Storage configuration for the blockchain history, chain states and binary blobs.
     #[arg(long = "storage")]
-    storage_config: StorageConfigNamespace,
+    storage_config: StorageConfig,
 
-    /// The maximal number of simultaneous queries to the database
-    #[arg(long)]
-    max_concurrent_queries: Option<usize>,
-
-    /// The maximal number of stream queries to the database
-    #[arg(long, default_value = "10")]
-    max_stream_queries: usize,
-
-    /// The maximal memory used in the storage cache.
-    #[arg(long, default_value = "10000000")]
-    pub max_cache_size: usize,
-
-    /// The maximal size of an entry in the storage cache.
-    #[arg(long, default_value = "1000000")]
-    pub max_entry_size: usize,
-
-    /// The maximal number of entries in the storage cache.
-    #[arg(long, default_value = "1000")]
-    pub max_cache_entries: usize,
-
-    /// Path to the file describing the initial user chains (aka genesis state)
-    #[arg(long = "genesis")]
-    genesis_config_path: PathBuf,
-
-    /// The replication factor for the keyspace
-    #[arg(long, default_value = "1")]
-    storage_replication_factor: u32,
+    /// Common storage options.
+    #[command(flatten)]
+    common_storage_options: CommonStorageOptions,
 
     /// Runs a specific proxy instance.
     #[arg(long)]
@@ -364,7 +339,13 @@ where
                 Box::new(self.storage.read_confirmed_block(*hash).await?),
             ))),
             DownloadCertificates(hashes) => {
-                let certificates = self.storage.read_certificates(hashes).await?;
+                let certificates = self.storage.read_certificates(hashes.clone()).await?;
+                let certificates = match ResultReadCertificates::new(certificates, hashes) {
+                    ResultReadCertificates::Certificates(certificates) => certificates,
+                    ResultReadCertificates::InvalidHashes(hashes) => {
+                        bail!("Missing certificates: {hashes:?}")
+                    }
+                };
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
             }
             BlobLastUsedBy(blob_id) => {
@@ -434,21 +415,12 @@ fn main() -> Result<()> {
 
 impl ProxyOptions {
     async fn run(&self) -> Result<()> {
-        let storage_cache_config = StorageCacheConfig {
-            max_cache_size: self.max_cache_size,
-            max_entry_size: self.max_entry_size,
-            max_cache_entries: self.max_cache_entries,
-        };
-        let common_config = CommonStoreConfig {
-            max_concurrent_queries: self.max_concurrent_queries,
-            max_stream_queries: self.max_stream_queries,
-            storage_cache_config,
-            replication_factor: self.storage_replication_factor,
-        };
-        let genesis_config: GenesisConfig = util::read_json(&self.genesis_config_path)?;
-        let store_config = self.storage_config.add_common_config(common_config).await?;
+        let store_config = self
+            .storage_config
+            .add_common_storage_options(&self.common_storage_options)
+            .await?;
         store_config
-            .run_with_storage(&genesis_config, None, ProxyContext::from_options(self)?)
+            .run_with_storage(None, ProxyContext::from_options(self)?)
             .boxed()
             .await?
     }

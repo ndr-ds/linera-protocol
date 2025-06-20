@@ -26,8 +26,8 @@ use linera_chain::{
     ChainError, ChainStateView,
 };
 use linera_execution::{ExecutionStateView, Query, QueryOutcome, ServiceRuntimeEndpoint};
-use linera_storage::{Clock as _, Storage};
-use linera_views::{views::ClonableView, ViewError};
+use linera_storage::{Clock as _, ResultReadCertificates, Storage};
+use linera_views::views::ClonableView;
 use tokio::sync::{oneshot, OwnedRwLockReadGuard, RwLock};
 
 #[cfg(test)]
@@ -261,6 +261,18 @@ where
             .await
     }
 
+    /// Preprocesses a block without executing it.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(super) async fn preprocess_certificate(
+        &mut self,
+        certificate: ConfirmedBlockCertificate,
+    ) -> Result<NetworkActions, WorkerError> {
+        ChainWorkerStateWithAttemptedChanges::new(self)
+            .await
+            .preprocess_certificate(certificate)
+            .await
+    }
+
     /// Updates the chain's inboxes, receiving messages from a cross-chain update.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_cross_chain_update(
@@ -436,16 +448,15 @@ where
     /// Loads pending cross-chain requests.
     async fn create_network_actions(&self) -> Result<NetworkActions, WorkerError> {
         let mut heights_by_recipient = BTreeMap::<_, Vec<_>>::new();
-        let mut targets = self.chain.outboxes.indices().await?;
+        let mut targets = self.chain.nonempty_outbox_chain_ids();
         if let Some(tracked_chains) = self.tracked_chains.as_ref() {
             let tracked_chains = tracked_chains
                 .read()
                 .expect("Panics should not happen while holding a lock to `tracked_chains`");
             targets.retain(|target| tracked_chains.contains(target));
         }
-        let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
+        let outboxes = self.chain.load_outboxes(&targets).await?;
         for (target, outbox) in targets.into_iter().zip(outboxes) {
-            let outbox = outbox.expect("Only existing outboxes should be referenced by `indices`");
             let heights = outbox.queue.elements().await?;
             heights_by_recipient.insert(target, heights);
         }
@@ -458,23 +469,45 @@ where
     ) -> Result<NetworkActions, WorkerError> {
         // Load all the certificates we will need, regardless of the medium.
         let heights = BTreeSet::from_iter(heights_by_recipient.values().flatten().copied());
-        let heights_usize = heights
-            .iter()
+        let next_block_height = self.chain.tip_state.get().next_block_height;
+        let log_heights = heights
+            .range(..next_block_height)
             .copied()
             .map(usize::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let hashes = self
+        let mut hashes = self
             .chain
             .confirmed_log
-            .multi_get(heights_usize.clone())
+            .multi_get(log_heights)
             .await?
             .into_iter()
-            .zip(heights_usize)
+            .zip(&heights)
             .map(|(maybe_hash, height)| {
-                maybe_hash.ok_or_else(|| ViewError::not_found("confirmed log entry", height))
+                maybe_hash.ok_or_else(|| WorkerError::ConfirmedLogEntryNotFound {
+                    height: *height,
+                    chain_id: self.chain_id(),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let certificates = self.storage.read_certificates(hashes).await?;
+        for height in heights.range(next_block_height..) {
+            hashes.push(
+                self.chain
+                    .preprocessed_blocks
+                    .get(height)
+                    .await?
+                    .ok_or_else(|| WorkerError::PreprocessedBlocksEntryNotFound {
+                        height: *height,
+                        chain_id: self.chain_id(),
+                    })?,
+            );
+        }
+        let certificates = self.storage.read_certificates(hashes.clone()).await?;
+        let certificates = match ResultReadCertificates::new(certificates, hashes) {
+            ResultReadCertificates::Certificates(certificates) => certificates,
+            ResultReadCertificates::InvalidHashes(hashes) => {
+                return Err(WorkerError::ReadCertificatesError(hashes))
+            }
+        };
         let certificates = heights
             .into_iter()
             .zip(certificates)
@@ -511,14 +544,13 @@ where
         let Some(tracked_chains) = self.tracked_chains.as_ref() else {
             return Ok(false);
         };
-        let mut targets = self.chain.outboxes.indices().await?;
+        let mut targets = self.chain.nonempty_outbox_chain_ids();
         {
             let tracked_chains = tracked_chains.read().unwrap();
             targets.retain(|target| tracked_chains.contains(target));
         }
-        let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
+        let outboxes = self.chain.load_outboxes(&targets).await?;
         for outbox in outboxes {
-            let outbox = outbox.expect("Only existing outboxes should be referenced by `indices`");
             let front = outbox.queue.front();
             if front.is_some_and(|key| *key <= height) {
                 return Ok(false);
