@@ -612,10 +612,8 @@ where
             .read_blob(blob_id)
             .await
             .map_err(Self::view_error_to_status)?;
-        let blob = blob
-            .map(Arc::unwrap_or_clone)
-            .ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
-        Ok(Response::new(blob.into_content().try_into()?))
+        let blob = blob.ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+        Ok(Response::new(blob.content().clone().try_into()?))
     }
 
     #[instrument(skip_all, err(Display), fields(method = "download_blobs"))]
@@ -666,15 +664,15 @@ where
         request: Request<CryptoHash>,
     ) -> Result<Response<Certificate>, Status> {
         let hash = request.into_inner().try_into()?;
-        let certificate: linera_chain::types::Certificate = Arc::unwrap_or_clone(
-            self.0
-                .storage
-                .read_certificate(hash)
-                .await
-                .map_err(Self::view_error_to_status)?
-                .ok_or_else(|| Status::not_found(hash.to_string()))?,
-        )
-        .into();
+        let certificate: linera_chain::types::Certificate = self
+            .0
+            .storage
+            .read_certificate(hash)
+            .await
+            .map_err(Self::view_error_to_status)?
+            .ok_or_else(|| Status::not_found(hash.to_string()))?
+            .as_ref()
+            .into();
         Ok(Response::new(certificate.try_into()?))
     }
 
@@ -750,8 +748,7 @@ where
 
         let returned_certificates =
             limiter.take_if(certificates_by_height, |lim, certificate| {
-                let cert: linera_chain::types::Certificate =
-                    Arc::unwrap_or_clone(certificate).into();
+                let cert: linera_chain::types::Certificate = certificate.as_ref().into();
                 Ok(lim.fits::<Certificate>(cert.clone())?.then_some(cert))
             })?;
 
