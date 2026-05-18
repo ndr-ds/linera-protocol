@@ -53,7 +53,7 @@ use linera_execution::{
     },
     ExecutionError, Operation, Query, QueryOutcome,
 };
-use linera_storage::{Clock as _, Storage as _};
+use linera_storage::{Arc as CacheArc, Clock as _, Storage as _};
 use linera_views::ViewError;
 use serde::Serialize;
 pub use state::State;
@@ -2035,11 +2035,11 @@ impl<Env: Environment> ChainClient<Env> {
         );
         debug!(round = %certificate.round, "Sending confirmed block to validators");
         let certificate = self.client.storage_client().cache_certificate(certificate);
-        self.update_validators(Some(&committee), Some(certificate.clone()))
+        self.update_validators(Some(&committee), Some(certificate.as_std().clone()))
             .await?;
         // Clear the pending proposal now that the block has been committed.
         *proposal_guard = None;
-        Ok(ClientOutcome::Committed(Some(Arc::unwrap_or_clone(
+        Ok(ClientOutcome::Committed(Some(CacheArc::unwrap_or_clone(
             certificate,
         ))))
     }
@@ -2099,9 +2099,9 @@ impl<Env: Environment> ChainClient<Env> {
             .finalize_block(&committee, certificate.clone())
             .await?;
         let certificate = self.client.storage_client().cache_certificate(certificate);
-        self.update_validators(Some(&committee), Some(certificate.clone()))
+        self.update_validators(Some(&committee), Some(certificate.as_std().clone()))
             .await?;
-        Ok(ClientOutcome::Committed(Some(Arc::unwrap_or_clone(
+        Ok(ClientOutcome::Committed(Some(CacheArc::unwrap_or_clone(
             certificate,
         ))))
     }
@@ -2690,6 +2690,7 @@ impl<Env: Environment> ChainClient<Env> {
             .read_confirmed_block(hash)
             .await?
             .ok_or(Error::MissingConfirmedBlock(hash))
+            .map(|b| b.into_std())
     }
 
     #[instrument(level = "trace", skip(hash))]
@@ -2702,6 +2703,7 @@ impl<Env: Environment> ChainClient<Env> {
             .read_certificate(hash)
             .await?
             .ok_or(Error::ReadCertificatesError(vec![hash]))
+            .map(|c| c.into_std())
     }
 
     /// Handles any cross-chain requests for any pending outgoing messages.
@@ -3202,7 +3204,7 @@ impl<Env: Environment> ChainClient<Env> {
         for certificate in certificates {
             let missing_blob_ids = match remote_node
                 .handle_confirmed_certificate(
-                    certificate.clone(),
+                    certificate.as_std().clone(),
                     CrossChainMessageDelivery::NonBlocking,
                 )
                 .await
@@ -3220,10 +3222,11 @@ impl<Env: Environment> ChainClient<Env> {
                 .await?
                 .into_iter()
                 .flatten()
+                .map(|b| b.into_std())
                 .collect();
             remote_node.upload_blobs(missing_blobs).await?;
             remote_node
-                .handle_confirmed_certificate(certificate, CrossChainMessageDelivery::NonBlocking)
+                .handle_confirmed_certificate(certificate.into_std(), CrossChainMessageDelivery::NonBlocking)
                 .await?;
         }
 
