@@ -37,8 +37,7 @@ use linera_service::{
     storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
-use linera_storage::Arc as CacheArc;
-use linera_storage::{ResultReadCertificates, Storage};
+use linera_storage::{Arc as CacheArc, ResultReadCertificates, Storage};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
