@@ -8,6 +8,9 @@ import "google/protobuf/empty.proto";
 service NotifierService {
   // Notify a client that there have been updates for chains.
   rpc NotifyBatch(NotificationBatch) returns (google.protobuf.Empty);
+
+  // Update the proxy's routing table entry for a chain. (admin)
+  rpc UpdateShardAssignment(ShardAssignmentUpdate) returns (google.protobuf.Empty);
 }
 
 // Interface provided by each physical shard (aka "worker") of a validator or a local node.
@@ -38,6 +41,20 @@ service ValidatorWorker {
 
   // Handle a (trusted!) cross-chain request.
   rpc HandleCrossChainRequest(CrossChainRequest) returns (google.protobuf.Empty);
+
+  // Release ownership of a chain to another shard: drains in-flight work for the
+  // chain, then stops accepting requests for it. (admin)
+  rpc ReleaseChain(ShardAssignmentUpdate) returns (google.protobuf.Empty);
+
+  // Take ownership of a chain and persist the new assignment. (admin)
+  rpc AcquireChain(ShardAssignmentUpdate) returns (google.protobuf.Empty);
+
+  // Update the worker's routing table entry for a chain, for cross-chain
+  // request routing. Does not change ownership of local state. (admin)
+  rpc UpdateShardAssignment(ShardAssignmentUpdate) returns (google.protobuf.Empty);
+
+  // Return the worker's current routing table entry for a chain. (admin)
+  rpc GetShardAssignment(ChainId) returns (ShardAssignmentUpdate);
 }
 
 // How to communicate with a validator or a local node.
@@ -169,6 +186,13 @@ message NetworkDescription {
 message ShardInfo {
     uint64 shard_id = 1;
     uint64 total_shards = 2;
+}
+
+// An update to the chain-to-shard routing table: `chain_id` is (to be) assigned
+// to the worker with shard id `shard_id`.
+message ShardAssignmentUpdate {
+    ChainId chain_id = 1;
+    uint64 shard_id = 2;
 }
 
 // A request for client to subscribe to notifications for a given `ChainId`

@@ -4,6 +4,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -19,7 +20,7 @@ use linera_core::{
     worker::{NetworkActions, Notification, Reason, WorkerState},
     JoinSetExt as _, ProcessConfirmedBlockMode, TaskHandle,
 };
-use linera_storage::Storage;
+use linera_storage::{ChainShardAssignments, Storage};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Channel, Request, Response, Status};
@@ -42,9 +43,16 @@ use super::{
 use crate::propagation::get_traffic_type_from_request;
 use crate::{
     config::{CrossChainConfig, NotificationConfig, ShardId, ValidatorInternalNetworkConfig},
-    cross_chain_message_queue, HandleConfirmedCertificateRequest, HandleLiteCertRequest,
-    HandleTimeoutCertificateRequest, HandleValidatedCertificateRequest,
+    cross_chain_message_queue,
+    routing::ShardRouter,
+    HandleConfirmedCertificateRequest, HandleLiteCertRequest, HandleTimeoutCertificateRequest,
+    HandleValidatedCertificateRequest,
 };
+
+/// Metadata key marking a request as already forwarded once by another worker.
+/// Forwarded requests are never forwarded again, preventing routing loops while
+/// worker routing tables are temporarily inconsistent during a migration.
+const FORWARDED_METADATA_KEY: &str = "x-linera-forwarded";
 
 type CrossChainSender = mpsc::Sender<(linera_core::data_types::CrossChainRequest, ShardId)>;
 type NotificationSender = tokio::sync::broadcast::Sender<Notification>;
@@ -280,6 +288,21 @@ where
     network: ValidatorInternalNetworkConfig,
     cross_chain_sender: CrossChainSender,
     notification_sender: NotificationSender,
+    /// Dynamic chain-to-shard routing table, shared with the cross-chain
+    /// send task. Also acts as the per-chain handover barrier.
+    router: Arc<ShardRouter>,
+    /// Connection pool for forwarding misrouted requests to the worker that
+    /// currently owns the target chain.
+    forward_pool: GrpcConnectionPool,
+}
+
+/// The outcome of routing an incoming request for a chain.
+enum Routed {
+    /// The chain is owned by this worker; process the request locally while
+    /// holding the routing read guard.
+    Local(tokio::sync::OwnedRwLockReadGuard<ShardId>),
+    /// The chain is owned by another worker; forward the request there.
+    Forward(ValidatorWorkerClient<Channel>),
 }
 
 /// A handle to a running [`GrpcServer`] task.
@@ -409,9 +432,16 @@ where
         let (cross_chain_sender, cross_chain_receiver) =
             mpsc::channel(cross_chain_config.queue_size);
 
+        let router = Arc::new(ShardRouter::new(
+            internal_network.public_key,
+            internal_network.shards.len(),
+        ));
+
         // Give the worker a shard-routing sender for cross-chain requests generated
         // outside the normal `NetworkActions` return path (specifically, the
-        // `RevertConfirm`s emitted after resetting a corrupted chain).
+        // `RevertConfirm`s emitted after resetting a corrupted chain). The shard id
+        // recorded here is only a hint: the send task re-resolves the target shard
+        // through the router at send time.
         let state = {
             let routing_network = internal_network.clone();
             let routing_sender = cross_chain_sender.clone();
@@ -434,6 +464,7 @@ where
             Self::forward_cross_chain_queries(
                 state.nickname().to_string(),
                 internal_network.clone(),
+                router.clone(),
                 cross_chain_config.max_retries,
                 Duration::from_millis(cross_chain_config.retry_delay_ms),
                 Duration::from_millis(cross_chain_config.max_backoff_ms),
@@ -476,13 +507,21 @@ where
             network: internal_network,
             cross_chain_sender,
             notification_sender,
+            router,
+            forward_pool: GrpcConnectionPool::default(),
         };
+
+        let seeding_server = grpc_server.clone();
 
         let worker_node = ValidatorWorkerServer::new(grpc_server)
             .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE);
 
         let handle = join_set.spawn_task(async move {
+            // Load the persisted chain-to-shard assignments before accepting any
+            // request, so that migrated chains survive a worker restart.
+            seeding_server.seed_router_from_storage().await;
+
             let server_address = SocketAddr::from((IpAddr::from_str(&host)?, port));
 
             let reflection_service = tonic_reflection::server::Builder::configure()
@@ -648,6 +687,7 @@ where
     async fn forward_cross_chain_queries(
         nickname: String,
         network: ValidatorInternalNetworkConfig,
+        router: Arc<ShardRouter>,
         cross_chain_max_retries: u32,
         cross_chain_retry_delay: Duration,
         cross_chain_max_backoff: Duration,
@@ -657,11 +697,18 @@ where
         receiver: mpsc::Receiver<(linera_core::data_types::CrossChainRequest, ShardId)>,
     ) {
         let pool = GrpcConnectionPool::default();
+        // The shard id recorded at enqueue time is only a hint; the target shard
+        // is re-resolved through the router on every (re-)send so that requests
+        // queued across a chain migration still reach the chain's new worker.
         let handle_request =
-            move |shard_id: ShardId, request: linera_core::data_types::CrossChainRequest| {
-                let channel_result = pool.channel(network.shard(shard_id).http_address());
+            move |_shard_hint: ShardId, request: linera_core::data_types::CrossChainRequest| {
+                let network = network.clone();
+                let router = router.clone();
+                let pool = pool.clone();
                 async move {
-                    let mut client = ValidatorWorkerClient::new(channel_result?)
+                    let shard_id = router.shard_for(request.target_chain_id()).await;
+                    let channel = pool.channel(network.shard(shard_id).http_address())?;
+                    let mut client = ValidatorWorkerClient::new(channel)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE);
                     client
@@ -720,6 +767,148 @@ where
             debug!(nickname, %error, "{}", context);
         }
     }
+
+    /// Returns whether the request was already forwarded once by another worker.
+    fn is_forwarded<R>(request: &Request<R>) -> bool {
+        request.metadata().contains_key(FORWARDED_METADATA_KEY)
+    }
+
+    /// Wraps a message in a request marked as forwarded, so that the receiving
+    /// worker will not forward it again.
+    fn forwarding_request<R>(inner: R) -> Request<R> {
+        let mut request = Request::new(inner);
+        request.metadata_mut().insert(
+            FORWARDED_METADATA_KEY,
+            tonic::metadata::MetadataValue::from(1),
+        );
+        request
+    }
+
+    /// Returns a client for the worker currently serving the given shard.
+    fn worker_client_for_shard(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<ValidatorWorkerClient<Channel>, Status> {
+        let address = self.network.shard(shard_id).http_address();
+        let channel = self
+            .forward_pool
+            .channel(address)
+            .map_err(|_| Status::internal("could not connect to shard"))?;
+        Ok(ValidatorWorkerClient::new(channel)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE))
+    }
+
+    /// Routes an incoming request for `chain_id`.
+    ///
+    /// If this worker currently owns the chain, returns a read guard on the
+    /// chain's routing entry; the caller must hold it for the duration of
+    /// request processing so that a concurrent migration waits for the request
+    /// to complete. Otherwise returns a client connected to the owning worker,
+    /// unless the request was already forwarded once, in which case an error is
+    /// returned to the (worker) caller, which will retry with fresh routing.
+    async fn route(&self, chain_id: ChainId, forwarded: bool) -> Result<Routed, Status> {
+        let guard = self.router.read_guard(chain_id).await;
+        let target = *guard;
+        if target == self.shard_id {
+            return Ok(Routed::Local(guard));
+        }
+        drop(guard);
+        if forwarded {
+            return Err(Status::failed_precondition(format!(
+                "chain {chain_id} is not assigned to shard {} (currently routed to shard \
+                 {target}); refusing to forward an already-forwarded request",
+                self.shard_id
+            )));
+        }
+        trace!(
+            %chain_id,
+            from_shard = self.shard_id,
+            to_shard = target,
+            "forwarding misrouted request"
+        );
+        Ok(Routed::Forward(self.worker_client_for_shard(target)?))
+    }
+
+    /// Loads the persisted chain-to-shard assignments into the router.
+    async fn seed_router_from_storage(&self) {
+        match self.state.storage_client().read_shard_assignments().await {
+            Ok(Some(assignments)) => {
+                let version = assignments.version;
+                let num_overrides = assignments.overrides.len();
+                let mut overrides = Vec::with_capacity(num_overrides);
+                for (chain_id, shard_id) in assignments.overrides {
+                    let Ok(shard_id) = ShardId::try_from(shard_id) else {
+                        warn!(%chain_id, shard_id, "ignoring invalid persisted shard assignment");
+                        continue;
+                    };
+                    overrides.push((chain_id, shard_id));
+                }
+                self.router.seed(overrides).await;
+                info!(
+                    version,
+                    num_overrides, "seeded shard router from persisted assignments"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%error, "failed to read persisted shard assignments; using default routing");
+            }
+        }
+    }
+
+    /// Persists the router's current assignment overrides to shared storage.
+    ///
+    /// Note: migrations are assumed to be issued sequentially by a single
+    /// administrator; concurrent writers would race on this read-modify-write.
+    async fn persist_assignments(&self) -> Result<(), Status> {
+        let storage = self.state.storage_client();
+        let version = match storage.read_shard_assignments().await {
+            Ok(assignments) => assignments.map_or(0, |assignments| assignments.version),
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "failed to read shard assignments: {error}"
+                )))
+            }
+        };
+        let assignments = ChainShardAssignments {
+            version: version + 1,
+            overrides: self
+                .router
+                .overrides()
+                .await
+                .into_iter()
+                .map(|(chain_id, shard_id)| (chain_id, shard_id as u64))
+                .collect(),
+        };
+        storage
+            .write_shard_assignments(&assignments)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("failed to write shard assignments: {error}"))
+            })?;
+        Ok(())
+    }
+
+    /// Parses and validates a `ShardAssignmentUpdate` message.
+    fn parse_assignment(
+        &self,
+        update: api::ShardAssignmentUpdate,
+    ) -> Result<(ChainId, ShardId), Status> {
+        let chain_id: ChainId = update
+            .chain_id
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?
+            .try_into()?;
+        let shard_id = usize::try_from(update.shard_id)
+            .map_err(|_| Status::invalid_argument("invalid shard ID"))?;
+        if shard_id >= self.network.shards.len() {
+            return Err(Status::invalid_argument(format!(
+                "shard {shard_id} does not exist; validator has {} shards",
+                self.network.shards.len()
+            )));
+        }
+        Ok((chain_id, shard_id))
+    }
 }
 
 #[tonic::async_trait]
@@ -741,7 +930,19 @@ where
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let proposal = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_block_proposal(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let proposal = inner.try_into()?;
         trace!(?proposal, "Handling block proposal");
         let (result, actions) = self.state.clone().handle_block_proposal(proposal).await;
         // Dispatch actions whether or not the proposal was accepted: a rejected
@@ -776,10 +977,22 @@ where
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_lite_certificate(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
         let HandleLiteCertRequest {
             certificate,
             wait_for_outgoing_messages,
-        } = request.into_inner().try_into()?;
+        } = inner.try_into()?;
         trace!(?certificate, "Handling lite certificate");
         let (sender, receiver) = wait_for_outgoing_messages.then(oneshot::channel).unzip();
         match Box::pin(
@@ -825,10 +1038,22 @@ where
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_confirmed_certificate(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
         let HandleConfirmedCertificateRequest {
             certificate,
             wait_for_outgoing_messages,
-        } = request.into_inner().try_into()?;
+        } = inner.try_into()?;
         trace!(?certificate, "Handling certificate");
         let (sender, receiver) = wait_for_outgoing_messages.then(oneshot::channel).unzip();
         match self
@@ -873,7 +1098,19 @@ where
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let HandleValidatedCertificateRequest { certificate } = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_validated_certificate(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let HandleValidatedCertificateRequest { certificate } = inner.try_into()?;
         trace!(?certificate, "Handling certificate");
         match self
             .state
@@ -912,7 +1149,19 @@ where
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let HandleTimeoutCertificateRequest { certificate } = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_timeout_certificate(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let HandleTimeoutCertificateRequest { certificate } = inner.try_into()?;
         trace!(?certificate, "Handling Timeout certificate");
         match self
             .state
@@ -950,7 +1199,19 @@ where
         request: Request<ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let query = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_chain_info_query(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let query = inner.try_into()?;
         trace!(?query, "Handling chain info query");
         match self.state.clone().handle_chain_info_query(query).await {
             Ok(info) => {
@@ -983,7 +1244,19 @@ where
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let (chain_id, blob_id) = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let routed_chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(routed_chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .download_pending_blob(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let (chain_id, blob_id) = inner.try_into()?;
         trace!(?blob_id, "Download pending blob");
         match self
             .state
@@ -1017,7 +1290,19 @@ where
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let (chain_id, blob_content) = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let inner = request.into_inner();
+        let routed_chain_id = GrpcProxyable::chain_id(&inner)
+            .ok_or_else(|| Status::invalid_argument("missing chain ID"))?;
+        let _route_guard = match self.route(routed_chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_pending_blob(Self::forwarding_request(inner))
+                    .await;
+            }
+        };
+        let (chain_id, blob_content) = inner.try_into()?;
         let blob = Blob::new(blob_content);
         let blob_id = blob.id();
         trace!(?blob_id, "Handle pending blob");
@@ -1048,7 +1333,23 @@ where
         request: Request<CrossChainRequest>,
     ) -> Result<Response<()>, Status> {
         let traffic_type = Self::get_traffic_type(&request);
-        let cross_chain_request = request.into_inner().try_into()?;
+        let forwarded = Self::is_forwarded(&request);
+        let cross_chain_request: linera_core::data_types::CrossChainRequest =
+            request.into_inner().try_into()?;
+        // Note: routing uses the domain-level `target_chain_id`, i.e. the chain
+        // whose state this request modifies (the recipient for updates, the
+        // sender for confirmations).
+        let target_chain_id = cross_chain_request.target_chain_id();
+        let _route_guard = match self.route(target_chain_id, forwarded).await? {
+            Routed::Local(guard) => guard,
+            Routed::Forward(mut client) => {
+                return client
+                    .handle_cross_chain_request(Self::forwarding_request(
+                        cross_chain_request.try_into()?,
+                    ))
+                    .await;
+            }
+        };
         trace!(?cross_chain_request, "Handling cross-chain request");
         match self
             .state
@@ -1070,6 +1371,78 @@ where
             }
         }
         Ok(Response::new(()))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn release_chain(
+        &self,
+        request: Request<api::ShardAssignmentUpdate>,
+    ) -> Result<Response<()>, Status> {
+        let (chain_id, target_shard) = self.parse_assignment(request.into_inner())?;
+        if target_shard == self.shard_id {
+            return Err(Status::invalid_argument(format!(
+                "cannot release chain {chain_id} to the shard that currently runs it \
+                 ({target_shard})"
+            )));
+        }
+        info!(
+            %chain_id,
+            from_shard = self.shard_id,
+            to_shard = target_shard,
+            "releasing chain"
+        );
+        // Flip the routing entry. This waits for all in-flight requests for the
+        // chain to complete; afterwards, new requests are forwarded to the
+        // target shard instead of being processed locally.
+        self.router.assign(chain_id, target_shard).await;
+        // Wait for any remaining (detached) writes and drop the chain's
+        // in-memory state; the target worker reloads it from shared storage.
+        self.state.drain_chain(chain_id).await;
+        self.persist_assignments().await?;
+        info!(%chain_id, to_shard = target_shard, "chain released");
+        Ok(Response::new(()))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn acquire_chain(
+        &self,
+        request: Request<api::ShardAssignmentUpdate>,
+    ) -> Result<Response<()>, Status> {
+        let (chain_id, target_shard) = self.parse_assignment(request.into_inner())?;
+        if target_shard != self.shard_id {
+            return Err(Status::invalid_argument(format!(
+                "acquire request for shard {target_shard} sent to shard {}",
+                self.shard_id
+            )));
+        }
+        info!(%chain_id, shard = self.shard_id, "acquiring chain");
+        self.router.assign(chain_id, target_shard).await;
+        self.persist_assignments().await?;
+        Ok(Response::new(()))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn update_shard_assignment(
+        &self,
+        request: Request<api::ShardAssignmentUpdate>,
+    ) -> Result<Response<()>, Status> {
+        let (chain_id, target_shard) = self.parse_assignment(request.into_inner())?;
+        trace!(%chain_id, shard = target_shard, "updating shard assignment");
+        self.router.assign(chain_id, target_shard).await;
+        Ok(Response::new(()))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn get_shard_assignment(
+        &self,
+        request: Request<api::ChainId>,
+    ) -> Result<Response<api::ShardAssignmentUpdate>, Status> {
+        let chain_id: ChainId = request.into_inner().try_into()?;
+        let shard_id = self.router.shard_for(chain_id).await;
+        Ok(Response::new(api::ShardAssignmentUpdate {
+            chain_id: Some(chain_id.into()),
+            shard_id: shard_id as u64,
+        }))
     }
 }
 

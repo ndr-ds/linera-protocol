@@ -521,6 +521,32 @@ enum ServerCommand {
         testing_prng_seed: Option<u64>,
     },
 
+    /// Migrates a chain to another shard (worker) of this validator, at runtime.
+    ///
+    /// Orchestrates the handover: the source worker drains in-flight work for the
+    /// chain and releases it, the target worker takes ownership and persists the
+    /// new assignment, and all other workers and proxies are notified of the
+    /// routing change. Requires the gRPC internal protocol.
+    #[command(name = "migrate-chain")]
+    MigrateChain {
+        /// Path to the file containing the server configuration of this Linera validator.
+        #[arg(long = "server")]
+        server_config_path: PathBuf,
+
+        /// The chain to migrate.
+        #[arg(long)]
+        chain_id: ChainId,
+
+        /// The shard that should take ownership of the chain.
+        #[arg(long)]
+        to_shard: usize,
+
+        /// The shard currently owning the chain. If not provided, it is queried
+        /// from the target worker's routing table.
+        #[arg(long)]
+        from_shard: Option<usize>,
+    },
+
     /// Replaces the configurations of the shards by following the given template.
     #[command(name = "edit-shards")]
     EditShards {
@@ -584,7 +610,9 @@ fn otlp_exporter_endpoint_for(command: &ServerCommand) -> Option<&str> {
             otlp_exporter_endpoint,
             ..
         } => otlp_exporter_endpoint.as_deref(),
-        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => None,
+        ServerCommand::Generate { .. }
+        | ServerCommand::EditShards { .. }
+        | ServerCommand::MigrateChain { .. } => None,
     }
 }
 
@@ -606,7 +634,9 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
             }
             .into()
         }
-        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => "server".into(),
+        ServerCommand::Generate { .. }
+        | ServerCommand::EditShards { .. }
+        | ServerCommand::MigrateChain { .. } => "server".into(),
     }
 }
 
@@ -716,6 +746,24 @@ async fn run(options: ServerOptions) {
             }
         }
 
+        ServerCommand::MigrateChain {
+            server_config_path,
+            chain_id,
+            to_shard,
+            from_shard,
+        } => {
+            let server_config: ValidatorServerConfig =
+                util::read_json(&server_config_path).expect("Failed to read server config");
+            migrate_chain(
+                &server_config.internal_network,
+                chain_id,
+                to_shard,
+                from_shard,
+            )
+            .await
+            .expect("Failed to migrate chain");
+        }
+
         ServerCommand::EditShards {
             server_config_path,
             num_shards,
@@ -734,6 +782,135 @@ async fn run(options: ServerOptions) {
                 .expect("Failed to write updated server config");
         }
     }
+}
+
+/// Orchestrates the runtime migration of a chain between two shards (workers)
+/// of the same validator.
+///
+/// The protocol is: (1) the source worker drains in-flight work for the chain
+/// and releases ownership, (2) the target worker takes ownership and persists
+/// the new assignment to the validator's shared storage, (3) the remaining
+/// workers and the proxies are notified of the routing change. Workers forward
+/// misrouted requests to the current owner, so a failed notification degrades
+/// performance for the affected chain but not correctness. Migrations are
+/// expected to be issued one at a time.
+async fn migrate_chain(
+    network: &ValidatorInternalNetworkConfig,
+    chain_id: ChainId,
+    to_shard: usize,
+    from_shard: Option<usize>,
+) -> anyhow::Result<()> {
+    use linera_rpc::grpc::api::{
+        self, notifier_service_client::NotifierServiceClient,
+        validator_worker_client::ValidatorWorkerClient,
+    };
+
+    anyhow::ensure!(
+        matches!(network.protocol, NetworkProtocol::Grpc(_)),
+        "chain migration requires the gRPC internal protocol"
+    );
+    anyhow::ensure!(
+        to_shard < network.shards.len(),
+        "shard {to_shard} does not exist; validator has {} shards",
+        network.shards.len()
+    );
+
+    let worker_client = |shard: usize| {
+        let address = network.shard(shard).http_address();
+        async move {
+            ValidatorWorkerClient::connect(address.clone())
+                .await
+                .with_context(|| format!("failed to connect to worker for shard {shard}"))
+        }
+    };
+
+    // Resolve the source shard from the target worker's routing table if it was
+    // not provided explicitly.
+    let from_shard = match from_shard {
+        Some(shard) => shard,
+        None => {
+            let mut client = worker_client(to_shard).await?;
+            let assignment = client
+                .get_shard_assignment(api::ChainId::from(chain_id))
+                .await
+                .context("failed to query current shard assignment")?
+                .into_inner();
+            usize::try_from(assignment.shard_id)
+                .context("target worker reported an invalid shard assignment")?
+        }
+    };
+    anyhow::ensure!(
+        from_shard != to_shard,
+        "chain {chain_id} is already assigned to shard {to_shard}"
+    );
+    anyhow::ensure!(
+        from_shard < network.shards.len(),
+        "shard {from_shard} does not exist; validator has {} shards",
+        network.shards.len()
+    );
+    info!("Migrating chain {chain_id} from shard {from_shard} to shard {to_shard}");
+
+    let update = api::ShardAssignmentUpdate {
+        chain_id: Some(chain_id.into()),
+        shard_id: to_shard as u64,
+    };
+
+    // Step 1: the source worker drains and releases the chain.
+    let mut source = worker_client(from_shard).await?;
+    source
+        .release_chain(update.clone())
+        .await
+        .context("source worker failed to release the chain")?;
+    info!("Shard {from_shard} released chain {chain_id}");
+
+    // Step 2: the target worker takes ownership and persists the assignment.
+    let mut target = worker_client(to_shard).await?;
+    target
+        .acquire_chain(update.clone())
+        .await
+        .context("target worker failed to acquire the chain")?;
+    info!("Shard {to_shard} acquired chain {chain_id}");
+
+    // Step 3: notify the remaining workers, for cross-chain request routing.
+    for shard in 0..network.shards.len() {
+        if shard == from_shard || shard == to_shard {
+            continue;
+        }
+        let result = async {
+            let mut client = worker_client(shard).await?;
+            client.update_shard_assignment(update.clone()).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            error!(
+                "Failed to notify shard {shard} of the new assignment: {error}. \
+                 Its requests for chain {chain_id} will be forwarded by shard {from_shard}."
+            );
+        }
+    }
+
+    // Step 4: notify the proxies, for client request routing.
+    for (id, proxy) in network.proxies.iter().enumerate() {
+        let address = proxy.internal_address(&network.protocol);
+        let result = async {
+            let mut client = NotifierServiceClient::connect(address.clone())
+                .await
+                .with_context(|| format!("failed to connect to proxy {id} at {address}"))?;
+            client.update_shard_assignment(update.clone()).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            error!(
+                "Failed to notify proxy {id} of the new assignment: {error}. \
+                 Its requests for chain {chain_id} will be forwarded by shard {from_shard}."
+            );
+        }
+    }
+
+    info!("Chain {chain_id} migrated to shard {to_shard}");
+    Ok(())
 }
 
 fn generate_shard_configs(

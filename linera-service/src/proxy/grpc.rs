@@ -44,6 +44,7 @@ use linera_rpc::{
         GrpcProtoConversionError, GrpcProxyable, GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
         GRPC_MAX_MESSAGE_SIZE,
     },
+    routing::ShardRouter,
 };
 use linera_sdk::{linera_base_types::Blob, views::ViewError};
 use linera_storage::{Arc as CacheArc, ResultReadCertificates, Storage};
@@ -209,6 +210,9 @@ struct GrpcProxyInner<S> {
     tls: TlsConfig,
     storage: S,
     id: usize,
+    /// Dynamic chain-to-shard routing table. Chains without an entry are routed
+    /// to their default (hash-based) shard.
+    router: ShardRouter,
 }
 
 impl<S> GrpcProxy<S>
@@ -223,6 +227,7 @@ where
         storage: S,
         id: usize,
     ) -> Self {
+        let router = ShardRouter::new(internal_config.public_key, internal_config.shards.len());
         Self(Arc::new(GrpcProxyInner {
             internal_config,
             worker_connection_pool: GrpcConnectionPool::default()
@@ -232,7 +237,42 @@ where
             tls,
             storage,
             id,
+            router,
         }))
+    }
+
+    /// Loads the persisted chain-to-shard assignments into the router, so that
+    /// migrated chains are routed correctly after a proxy restart.
+    async fn seed_router_from_storage(&self) {
+        match self.0.storage.read_shard_assignments().await {
+            Ok(Some(assignments)) => {
+                let version = assignments.version;
+                let num_overrides = assignments.overrides.len();
+                let mut overrides = Vec::with_capacity(num_overrides);
+                for (chain_id, shard_id) in assignments.overrides {
+                    let Ok(shard_id) = usize::try_from(shard_id) else {
+                        tracing::warn!(
+                            %chain_id, shard_id,
+                            "ignoring invalid persisted shard assignment"
+                        );
+                        continue;
+                    };
+                    overrides.push((chain_id, shard_id));
+                }
+                self.0.router.seed(overrides).await;
+                info!(
+                    version,
+                    num_overrides, "seeded proxy shard router from persisted assignments"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to read persisted shard assignments; using default routing"
+                );
+            }
+        }
     }
 
     fn as_validator_node(&self) -> ValidatorNodeServer<Self> {
@@ -265,13 +305,10 @@ where
         SocketAddr::from(([0, 0, 0, 0], self.config().private_port))
     }
 
-    fn shard_for(&self, proxyable: &impl GrpcProxyable) -> Option<ShardConfig> {
-        Some(
-            self.0
-                .internal_config
-                .get_shard_for(proxyable.chain_id()?)
-                .clone(),
-        )
+    async fn shard_for(&self, proxyable: &impl GrpcProxyable) -> Option<ShardConfig> {
+        let chain_id = proxyable.chain_id()?;
+        let shard_id = self.0.router.shard_for(chain_id).await;
+        Some(self.0.internal_config.shard(shard_id).clone())
     }
 
     fn worker_client_for_shard(
@@ -307,6 +344,10 @@ where
     ) -> Result<()> {
         info!("Starting proxy");
         let mut join_set = JoinSet::new();
+
+        // Load the persisted chain-to-shard assignments before accepting any
+        // request, so that migrated chains are routed correctly after a restart.
+        self.seed_router_from_storage().await;
 
         #[cfg(with_metrics)]
         monitoring_server::start_metrics_with_profiling(
@@ -387,7 +428,7 @@ where
     }
 
     #[instrument(skip_all, fields(remote_addr = ?request.remote_addr(), chain_id = ?request.get_ref().chain_id()))]
-    fn worker_client<R>(
+    async fn worker_client<R>(
         &self,
         request: Request<R>,
     ) -> Result<(ValidatorWorkerClient<Channel>, R), Status>
@@ -398,6 +439,7 @@ where
         let inner = request.into_inner();
         let shard = self
             .shard_for(&inner)
+            .await
             .ok_or_else(|| Status::not_found("could not find shard for message"))?;
         let client = self
             .worker_client_for_shard(&shard)
@@ -459,7 +501,7 @@ where
         &self,
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_block_proposal(Self::create_forwarding_request(inner))
             .await
@@ -470,7 +512,7 @@ where
         &self,
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_lite_certificate(Self::create_forwarding_request(inner))
             .await
@@ -485,7 +527,7 @@ where
         &self,
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_confirmed_certificate(Self::create_forwarding_request(inner))
             .await
@@ -500,7 +542,7 @@ where
         &self,
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_validated_certificate(Self::create_forwarding_request(inner))
             .await
@@ -511,7 +553,7 @@ where
         &self,
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_timeout_certificate(Self::create_forwarding_request(inner))
             .await
@@ -522,7 +564,7 @@ where
         &self,
         request: Request<api::ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client
             .handle_chain_info_query(Self::create_forwarding_request(inner))
             .await
@@ -578,7 +620,7 @@ where
         request: Request<api::ChainId>,
     ) -> Result<Response<api::ShardInfo>, Status> {
         let chain_id = request.into_inner().try_into()?;
-        let shard_id = self.0.internal_config.get_shard_id(chain_id);
+        let shard_id = self.0.router.shard_for(chain_id).await;
         let total_shards = self.0.internal_config.shards.len();
 
         let shard_info = api::ShardInfo {
@@ -647,7 +689,7 @@ where
         &self,
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client.download_pending_blob(inner).await
     }
 
@@ -656,7 +698,7 @@ where
         &self,
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request)?;
+        let (mut client, inner) = self.worker_client(request).await?;
         client.handle_pending_blob(inner).await
     }
 
@@ -887,6 +929,29 @@ where
                 .try_into()?;
             self.0.notifier.notify_chain(&chain_id, &Ok(notification));
         }
+        Ok(Response::new(()))
+    }
+
+    #[instrument(skip_all, err(Display), fields(method = "update_shard_assignment"))]
+    async fn update_shard_assignment(
+        &self,
+        request: Request<api::ShardAssignmentUpdate>,
+    ) -> Result<Response<()>, Status> {
+        let update = request.into_inner();
+        let chain_id: ChainId = update
+            .chain_id
+            .ok_or_else(|| Status::invalid_argument("Missing field: chain_id."))?
+            .try_into()?;
+        let shard_id = usize::try_from(update.shard_id)
+            .map_err(|_| Status::invalid_argument("invalid shard ID"))?;
+        if shard_id >= self.0.internal_config.shards.len() {
+            return Err(Status::invalid_argument(format!(
+                "shard {shard_id} does not exist; validator has {} shards",
+                self.0.internal_config.shards.len()
+            )));
+        }
+        info!(%chain_id, shard_id, "updating proxy shard assignment");
+        self.0.router.assign(chain_id, shard_id).await;
         Ok(Response::new(()))
     }
 }
