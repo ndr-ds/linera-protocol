@@ -100,6 +100,7 @@ indicatif.workspace = true
 insta.workspace = true
 is-terminal.workspace = true
 linera-base.workspace = true
+linera-cache.workspace = true
 linera-chain.workspace = true
 linera-client = { workspace = true, features = ["fs"] }
 linera-core.workspace = true
@@ -127,6 +128,7 @@ linera-views.workspace = true
 linera-wallet-json.workspace = true
 lru.workspace = true
 nonzero_lit.workspace = true
+num-format.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
@@ -229,6 +231,10 @@ path = "src/schema_export.rs"
 [[bin]]
 name = "linera-benchmark"
 path = "src/benchmark.rs"
+
+[[bin]]
+name = "linera-lite-benchmark"
+path = "src/lite_benchmark.rs"
 
 [[bench]]
 name = "transfers"
