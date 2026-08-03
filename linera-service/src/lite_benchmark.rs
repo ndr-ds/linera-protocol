@@ -21,12 +21,14 @@
 
 use std::{
     collections::HashMap,
+    fs::File,
+    io::Write as _,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -59,6 +61,19 @@ use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// The cross-chain traffic pattern to generate, mirroring `linera-paper-eval`'s
+/// `TransferTargetMode`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TrafficMode {
+    /// Every transfer is a self-transfer: no cross-chain messages at all.
+    Independent,
+    /// Transfers alternate between a self-transfer and a transfer to another benchmarked
+    /// chain, chosen at random.
+    Mixed,
+    /// Every transfer goes to another benchmarked chain, chosen at random; never to self.
+    Full,
+}
+
 #[derive(clap::Parser)]
 #[command(
     name = "linera-lite-benchmark",
@@ -87,9 +102,21 @@ struct Args {
     #[arg(long, default_value = "1")]
     transactions_per_block: usize,
 
+    /// The cross-chain traffic pattern: independent (self-transfers only, the default),
+    /// mixed (half self, half spread across the other benchmarked chains), or full (always a
+    /// different benchmarked chain). `mixed` and `full` require at least 2 chains.
+    #[arg(long, value_enum, default_value_t = TrafficMode::Independent)]
+    traffic_mode: TrafficMode,
+
     /// If set, stop after this many seconds.
     #[arg(long)]
     runtime_in_seconds: Option<u64>,
+
+    /// If set, write one row per committed/failed block to this CSV path, with columns
+    /// chain_id,ts_within_experiment,num_tx,result,duration_micros -- matching
+    /// `linera-paper-eval`'s `transfers.csv` schema.
+    #[arg(long)]
+    output_csv: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -121,6 +148,12 @@ async fn main() -> Result<()> {
         args.chains.clone()
     };
     anyhow::ensure!(!chain_ids.is_empty(), "no chains to benchmark");
+    anyhow::ensure!(
+        chain_ids.len() > 1 || matches!(args.traffic_mode, TrafficMode::Independent),
+        "traffic-mode {:?} requires at least 2 chains",
+        args.traffic_mode
+    );
+    let all_chain_ids = chain_ids.clone();
 
     let mut chain_clients = Vec::new();
     for chain_id in chain_ids {
@@ -158,6 +191,7 @@ async fn main() -> Result<()> {
     let mut bps_remainder = args.bps % num_chains;
     let success_count = Arc::new(AtomicUsize::new(0));
     let failure_count = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
 
     let mut join_set = task::JoinSet::new();
     for client in chain_clients {
@@ -172,8 +206,31 @@ async fn main() -> Result<()> {
         let failure_count = failure_count.clone();
         let owner = client.owner;
         let chain_id = client.chain_id;
-        let generator = NativeFungibleTransferGenerator::new(chain_id, vec![], true)
-            .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
+        // Build the destination list and self-avoidance for the requested traffic mode. See
+        // `TrafficMode`'s doc comments for the semantics of each variant.
+        let (destinations, avoid_self) = match args.traffic_mode {
+            TrafficMode::Independent => (vec![], true),
+            TrafficMode::Full => (
+                all_chain_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != chain_id)
+                    .collect(),
+                true,
+            ),
+            TrafficMode::Mixed => (
+                all_chain_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != chain_id)
+                    .flat_map(|other| [other, chain_id])
+                    .collect(),
+                false,
+            ),
+        };
+        let generator =
+            NativeFungibleTransferGenerator::new(chain_id, destinations, true, avoid_self)
+                .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
         let transactions_per_block = args.transactions_per_block;
         join_set.spawn(run_chain(
             client,
@@ -184,6 +241,7 @@ async fn main() -> Result<()> {
             shutdown,
             success_count,
             failure_count,
+            start,
         ));
     }
 
@@ -208,12 +266,38 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut records = Vec::new();
     while let Some(result) = join_set.join_next().await {
-        result??;
+        records.extend(result??);
     }
     shutdown.cancel();
     report_task.await?;
 
+    if let Some(output_csv) = &args.output_csv {
+        write_records_csv(output_csv, &records)
+            .with_context(|| format!("failed to write {}", output_csv.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Writes one row per committed/failed block, matching `linera-paper-eval`'s `transfers.csv`
+/// schema (a subset of its columns -- this tool has no notion of experiment/network_config/
+/// repetition/phase, so those are omitted).
+fn write_records_csv(path: &std::path::Path, records: &[BlockRecord]) -> Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "chain_id,ts_within_experiment,num_tx,result,duration_micros")?;
+    for record in records {
+        writeln!(
+            file,
+            "{},{},{},{},{}",
+            record.chain_id,
+            record.elapsed_since_start.as_secs_f64(),
+            record.num_tx,
+            record.result,
+            record.duration.as_micros(),
+        )?;
+    }
     Ok(())
 }
 
@@ -227,8 +311,10 @@ async fn run_chain(
     shutdown: CancellationToken,
     success_count: Arc<AtomicUsize>,
     failure_count: Arc<AtomicUsize>,
-) -> Result<()> {
+    start: Instant,
+) -> Result<Vec<BlockRecord>> {
     let chain_id = client.chain_id;
+    let mut records = Vec::new();
     let mut interval = if bps > 0 {
         Some(time::interval(Duration::from_secs_f64(1.0 / bps as f64)))
     } else {
@@ -242,18 +328,41 @@ async fn run_chain(
             interval.tick().await;
         }
         let operations = generator.generate_operations(owner, transactions_per_block);
-        match client.propose_and_commit(operations).await {
+        let num_tx = operations.len();
+        let before = Instant::now();
+        let outcome = client.propose_and_commit(operations).await;
+        let duration = before.elapsed();
+        let result = match outcome {
             Ok(()) => {
                 success_count.fetch_add(1, Ordering::Relaxed);
+                "committed"
             }
             Err(error) => {
                 warn!(%chain_id, %error, "failed to commit a block");
                 failure_count.fetch_add(1, Ordering::Relaxed);
+                "failed"
             }
-        }
+        };
+        records.push(BlockRecord {
+            chain_id,
+            elapsed_since_start: before.saturating_duration_since(start),
+            num_tx,
+            result,
+            duration,
+        });
     }
     info!(%chain_id, "stopping benchmark");
-    Ok(())
+    Ok(records)
+}
+
+/// One committed or failed block, timed relative to the benchmark's start. See
+/// `write_records_csv` for the on-disk schema.
+struct BlockRecord {
+    chain_id: ChainId,
+    elapsed_since_start: Duration,
+    num_tx: usize,
+    result: &'static str,
+    duration: Duration,
 }
 
 /// Tracks just enough state about one chain to keep proposing valid blocks, without any
