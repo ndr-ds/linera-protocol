@@ -304,19 +304,30 @@ impl std::str::FromStr for NetworkProtocol {
     }
 }
 
+/// The default (static) shard assignment: a hash of the validator public key and
+/// the chain ID, reduced modulo the number of shards. Chains that have not been
+/// explicitly reassigned (see `routing::ShardRouter`) live on their default shard.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "result is reduced modulo num_shards, so any truncation is irrelevant"
+)]
+pub fn default_shard_id(
+    public_key: &ValidatorPublicKey,
+    num_shards: usize,
+    chain_id: ChainId,
+) -> ShardId {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    // Use the validator public key to randomise shard assignment.
+    public_key.hash(&mut s);
+    chain_id.hash(&mut s);
+    (s.finish() as ShardId) % num_shards
+}
+
 impl<P> ValidatorInternalNetworkPreConfig<P> {
     /// Static shard assignment
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "result is reduced modulo shards.len(), so any truncation is irrelevant"
-    )]
     pub fn get_shard_id(&self, chain_id: ChainId) -> ShardId {
-        use std::hash::{Hash, Hasher};
-        let mut s = std::collections::hash_map::DefaultHasher::new();
-        // Use the validator public key to randomise shard assignment.
-        self.public_key.hash(&mut s);
-        chain_id.hash(&mut s);
-        (s.finish() as ShardId) % self.shards.len()
+        default_shard_id(&self.public_key, self.shards.len(), chain_id)
     }
 
     /// Returns the [`ShardConfig`] for the given shard id.

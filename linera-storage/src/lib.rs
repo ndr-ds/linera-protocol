@@ -43,7 +43,8 @@ use linera_views::{context::Context, views::RootView, ViewError};
 #[cfg(with_metrics)]
 pub use crate::db_storage::metrics;
 pub use crate::db_storage::{
-    ChainStatesFirstAssignment, DbStorage, RootKey, StorageCacheConfig, StorageCaches, WallClock,
+    ChainShardAssignments, ChainStatesFirstAssignment, DbStorage, RootKey, StorageCacheConfig,
+    StorageCaches, WallClock,
 };
 #[cfg(with_testing)]
 pub use crate::db_storage::{TestClock, DEFAULT_STORAGE_CACHE_CONFIG};
@@ -253,6 +254,18 @@ pub trait Storage: linera_base::util::traits::AutoTraits + Sized {
     async fn write_network_description(
         &self,
         information: &NetworkDescription,
+    ) -> Result<(), ViewError>;
+
+    /// Reads the validator's dynamic chain-to-shard assignment table.
+    ///
+    /// Returns `None` if no chain has ever been reassigned. This is
+    /// validator-local state, not part of the replicated chain state.
+    async fn read_shard_assignments(&self) -> Result<Option<ChainShardAssignments>, ViewError>;
+
+    /// Writes the validator's dynamic chain-to-shard assignment table.
+    async fn write_shard_assignments(
+        &self,
+        assignments: &ChainShardAssignments,
     ) -> Result<(), ViewError>;
 
     /// Initializes a chain in a simple way (used for testing and to create a genesis state).
@@ -1010,6 +1023,42 @@ mod tests {
         Ok(())
     }
 
+    async fn test_storage_shard_assignments<S: Storage + Sync>(storage: &S) -> Result<(), ViewError>
+    where
+        S::Context: Send + Sync,
+    {
+        // Test reading non-existent assignments
+        assert!(storage.read_shard_assignments().await?.is_none());
+
+        // Write assignments
+        let assignments = ChainShardAssignments {
+            version: 1,
+            overrides: [
+                (ChainId(CryptoHash::test_hash("migrated_chain_1")), 2),
+                (ChainId(CryptoHash::test_hash("migrated_chain_2")), 0),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        storage.write_shard_assignments(&assignments).await?;
+        assert_eq!(
+            storage.read_shard_assignments().await?,
+            Some(assignments.clone())
+        );
+
+        // Overwrite with a newer version
+        let updated = ChainShardAssignments {
+            version: 2,
+            overrides: [(ChainId(CryptoHash::test_hash("migrated_chain_1")), 3)]
+                .into_iter()
+                .collect(),
+        };
+        storage.write_shard_assignments(&updated).await?;
+        assert_eq!(storage.read_shard_assignments().await?, Some(updated));
+
+        Ok(())
+    }
+
     /// Generic test function to test Storage trait features
     #[test_case(DbStorage::<MemoryDatabase, _>::make_test_storage(None).await; "memory")]
     #[cfg_attr(feature = "scylladb", test_case(DbStorage::<ScyllaDbDatabase, _>::make_test_storage(None).await; "scylla_db"))]
@@ -1023,6 +1072,7 @@ mod tests {
         test_storage_certificate(&storage).await?;
         test_storage_event(&storage).await?;
         test_storage_network_description(&storage).await?;
+        test_storage_shard_assignments(&storage).await?;
         Ok(())
     }
 }

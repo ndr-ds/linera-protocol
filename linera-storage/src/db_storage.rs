@@ -310,6 +310,24 @@ const BLOCK_KEY: &[u8] = &[3];
 /// The key used for the network description.
 const NETWORK_DESCRIPTION_KEY: &[u8] = &[4];
 
+/// The key used for the chain-to-shard assignment table.
+const SHARD_ASSIGNMENTS_KEY: &[u8] = &[5];
+
+/// The dynamic chain-to-shard assignment table of a validator.
+///
+/// Chains without an entry are assigned to their default (hash-based) shard.
+/// This table is shared by all workers of a validator through common storage; it
+/// records chains that have been migrated away from their default shard so that
+/// routing survives worker restarts. It is *not* part of the replicated (BFT)
+/// state: each validator maintains its own table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainShardAssignments {
+    /// Version of the table, incremented on every update.
+    pub version: u64,
+    /// Chains assigned to a shard other than their default one.
+    pub overrides: BTreeMap<ChainId, u64>,
+}
+
 fn get_block_keys() -> Vec<Vec<u8>> {
     vec![LITE_CERTIFICATE_KEY.to_vec(), BLOCK_KEY.to_vec()]
 }
@@ -428,6 +446,17 @@ impl MultiPartitionBatch {
         let root_key = RootKey::NetworkDescription.bytes();
         let key = NETWORK_DESCRIPTION_KEY.to_vec();
         let value = bcs::to_bytes(information)?;
+        self.put_key_value(root_key, key, value);
+        Ok(())
+    }
+
+    fn add_shard_assignments(
+        &mut self,
+        assignments: &ChainShardAssignments,
+    ) -> Result<(), ViewError> {
+        let root_key = RootKey::ShardAssignments.bytes();
+        let key = SHARD_ASSIGNMENTS_KEY.to_vec();
+        let value = bcs::to_bytes(assignments)?;
         self.put_key_value(root_key, key, value);
         Ok(())
     }
@@ -565,6 +594,8 @@ pub enum RootKey {
     BlockByHeight(ChainId),
     /// The event-to-block-height index of a chain.
     EventBlockHeight(ChainId),
+    /// The dynamic chain-to-shard assignment table of this validator.
+    ShardAssignments,
 }
 
 const CHAIN_ID_TAG: u8 = 2;
@@ -1592,6 +1623,24 @@ where
     ) -> Result<(), ViewError> {
         let mut batch = MultiPartitionBatch::new();
         batch.add_network_description(information)?;
+        self.write_batch(batch).await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn read_shard_assignments(&self) -> Result<Option<ChainShardAssignments>, ViewError> {
+        let root_key = RootKey::ShardAssignments.bytes();
+        let store = self.database.open_shared(&root_key)?;
+        Ok(store.read_value(SHARD_ASSIGNMENTS_KEY).await?)
+    }
+
+    #[instrument(skip_all)]
+    async fn write_shard_assignments(
+        &self,
+        assignments: &ChainShardAssignments,
+    ) -> Result<(), ViewError> {
+        let mut batch = MultiPartitionBatch::new();
+        batch.add_shard_assignments(assignments)?;
         self.write_batch(batch).await?;
         Ok(())
     }

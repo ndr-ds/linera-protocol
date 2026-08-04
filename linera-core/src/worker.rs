@@ -773,15 +773,6 @@ where
 
     /// Returns the storage client so that it can be manipulated or queried.
     #[instrument(level = "trace", skip(self))]
-    #[cfg(not(feature = "test"))]
-    pub(crate) fn storage_client(&self) -> &StorageClient {
-        &self.storage
-    }
-
-    /// Returns the storage client so that it can be manipulated or queried by tests in other
-    /// crates.
-    #[instrument(level = "trace", skip(self))]
-    #[cfg(feature = "test")]
     pub fn storage_client(&self) -> &StorageClient {
         &self.storage
     }
@@ -1159,6 +1150,42 @@ where
         if removed.is_err() {
             tracing::trace!(%chain_id, "Poisoned worker entry already replaced; skipping eviction");
         }
+    }
+
+    /// Drains in-flight work for a chain and evicts its in-memory state, in
+    /// preparation for handing the chain over to another worker of the same
+    /// validator.
+    ///
+    /// This waits for any in-flight operation on the chain — including detached
+    /// write tasks that survive caller cancellation — by acquiring the chain
+    /// worker's write lock, then drops the cached chain worker and the
+    /// cross-chain batch driver. Any uncommitted in-memory changes are rolled
+    /// back; the successor worker reloads the chain from shared storage.
+    ///
+    /// The caller is responsible for ensuring that no *new* requests for this
+    /// chain are dispatched to this `WorkerState` (the RPC layer enforces this
+    /// through its per-chain ownership barrier).
+    pub async fn drain_chain(&self, chain_id: ChainId) {
+        // Remove the per-chain cross-chain batch driver so that no new batches
+        // can attach to it. In-flight batch requests are awaited by their RPC
+        // callers, which the RPC-layer barrier has already waited for.
+        self.chain_batches.pin().remove(&chain_id);
+
+        // If a chain worker is loaded, wait until all current readers and
+        // writers (including detached save tasks) have finished.
+        let maybe_worker = {
+            let pin = self.chain_workers.pin();
+            pin.get(&chain_id)
+                .and_then(|entry| entry.peek())
+                .and_then(|result| result.clone().ok())
+                .and_then(|weak| weak.upgrade())
+        };
+        if let Some(worker) = maybe_worker {
+            // Acquiring the write lock is the barrier; a `PoisonedWorker` error
+            // is irrelevant here since we evict the worker anyway.
+            drop(handle::write_lock(&worker).await);
+        }
+        self.chain_workers.pin().remove(&chain_id);
     }
 
     /// Returns or creates the per-chain batch state.

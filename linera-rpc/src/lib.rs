@@ -13,6 +13,9 @@
 pub mod config;
 /// Construction of validator-node clients from network configuration.
 pub mod node_provider;
+/// Dynamic chain-to-shard routing for elastic validators.
+#[cfg(with_server)]
+pub mod routing;
 
 /// A network-agnostic client for talking to a validator node.
 pub mod client;

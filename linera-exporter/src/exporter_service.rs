@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use linera_core::worker::Reason;
 use linera_rpc::grpc::api::{
     notifier_service_server::{NotifierService, NotifierServiceServer},
-    Notification, NotificationBatch,
+    Notification, NotificationBatch, ShardAssignmentUpdate,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,17 @@ impl NotifierService for ExporterService {
         }
 
         Ok(Response::new(()))
+    }
+
+    async fn update_shard_assignment(
+        &self,
+        _request: Request<ShardAssignmentUpdate>,
+    ) -> Result<Response<()>, Status> {
+        // The exporter does not route requests to shards, so there is nothing
+        // to update.
+        Err(Status::unimplemented(
+            "the block exporter does not maintain a shard routing table",
+        ))
     }
 }
 
