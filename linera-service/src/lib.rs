@@ -13,6 +13,8 @@ pub mod cli_wrappers;
 pub mod config;
 /// The controller that orchestrates worker services.
 pub mod controller;
+/// The validator manager: load-driven chain migration and elastic workers.
+pub mod manager;
 /// The GraphQL node service exposing wallet and chain state.
 pub mod node_service;
 /// Helpers for creating and building application projects.

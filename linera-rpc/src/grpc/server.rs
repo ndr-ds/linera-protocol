@@ -294,6 +294,9 @@ where
     /// Connection pool for forwarding misrouted requests to the worker that
     /// currently owns the target chain.
     forward_pool: GrpcConnectionPool,
+    /// Per-chain counters of locally processed requests since the last load
+    /// report. Used by the validator manager as its load signal.
+    load_tracker: Arc<papaya::HashMap<ChainId, std::sync::atomic::AtomicU64>>,
 }
 
 /// The outcome of routing an incoming request for a chain.
@@ -435,6 +438,7 @@ where
         let router = Arc::new(ShardRouter::new(
             internal_network.public_key,
             internal_network.shards.len(),
+            internal_network.num_base_shards(),
         ));
 
         // Give the worker a shard-routing sender for cross-chain requests generated
@@ -509,6 +513,7 @@ where
             notification_sender,
             router,
             forward_pool: GrpcConnectionPool::default(),
+            load_tracker: Arc::new(papaya::HashMap::new()),
         };
 
         let seeding_server = grpc_server.clone();
@@ -811,6 +816,11 @@ where
         let guard = self.router.read_guard(chain_id).await;
         let target = *guard;
         if target == self.shard_id {
+            // Record the locally processed request for the manager's load signal.
+            self.load_tracker
+                .pin()
+                .get_or_insert_with(chain_id, || std::sync::atomic::AtomicU64::new(0))
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Routed::Local(guard));
         }
         drop(guard);
@@ -1443,6 +1453,51 @@ where
             chain_id: Some(chain_id.into()),
             shard_id: shard_id as u64,
         }))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn get_load_report(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<api::LoadReport>, Status> {
+        // Drain the counters: each report returns the number of requests
+        // processed per chain since the previous report. Entries are kept in
+        // the map (at zero) to avoid racing with concurrent increments.
+        let mut loads = Vec::new();
+        {
+            let pin = self.load_tracker.pin();
+            for (chain_id, counter) in pin.iter() {
+                let requests = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if requests > 0 {
+                    loads.push(api::ChainLoad {
+                        chain_id: Some((*chain_id).into()),
+                        requests,
+                    });
+                }
+            }
+        }
+        Ok(Response::new(api::LoadReport {
+            shard_id: self.shard_id as u64,
+            loads,
+        }))
+    }
+
+    #[instrument(target = "grpc_server", skip_all, err, fields(nickname = self.state.nickname()))]
+    async fn list_shard_assignments(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<api::ShardAssignmentList>, Status> {
+        let entries = self
+            .router
+            .overrides()
+            .await
+            .into_iter()
+            .map(|(chain_id, shard_id)| api::ShardAssignmentUpdate {
+                chain_id: Some(chain_id.into()),
+                shard_id: shard_id as u64,
+            })
+            .collect();
+        Ok(Response::new(api::ShardAssignmentList { entries }))
     }
 }
 

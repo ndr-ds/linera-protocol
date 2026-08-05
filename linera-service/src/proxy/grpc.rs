@@ -227,7 +227,11 @@ where
         storage: S,
         id: usize,
     ) -> Self {
-        let router = ShardRouter::new(internal_config.public_key, internal_config.shards.len());
+        let router = ShardRouter::new(
+            internal_config.public_key,
+            internal_config.shards.len(),
+            internal_config.num_base_shards(),
+        );
         Self(Arc::new(GrpcProxyInner {
             internal_config,
             worker_connection_pool: GrpcConnectionPool::default()

@@ -180,6 +180,13 @@ pub struct ValidatorInternalNetworkPreConfig<P> {
     /// The available shards. Each chain UID is mapped to a unique shard in the vector in
     /// a static way.
     pub shards: Vec<ShardConfig>,
+    /// The number of *base* shards, i.e. the prefix of `shards` that receives
+    /// default (hash-based) chain assignments. The remaining shards are
+    /// *elastic* slots: they only ever own chains explicitly migrated to them,
+    /// so their workers can be started and stopped at runtime without making
+    /// any default-routed chain unreachable. Defaults to all shards.
+    #[serde(default)]
+    pub base_shards: Option<usize>,
     /// The server configurations for the linera-exporter.
     /// They can be used as optional locations to forward notifications to destinations other than
     /// the proxy, by the workers.
@@ -195,8 +202,19 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
             public_key: self.public_key,
             protocol,
             shards: self.shards.clone(),
+            base_shards: self.base_shards,
             block_exporters: self.block_exporters.clone(),
             proxies: self.proxies.clone(),
+        }
+    }
+
+    /// Returns the number of base shards, i.e. the modulus of the default
+    /// (hash-based) chain-to-shard assignment. Shards beyond this prefix are
+    /// elastic slots that only serve explicitly migrated chains.
+    pub fn num_base_shards(&self) -> usize {
+        match self.base_shards {
+            Some(count) if count > 0 => count.min(self.shards.len()),
+            _ => self.shards.len(),
         }
     }
 }
@@ -327,7 +345,7 @@ pub fn default_shard_id(
 impl<P> ValidatorInternalNetworkPreConfig<P> {
     /// Static shard assignment
     pub fn get_shard_id(&self, chain_id: ChainId) -> ShardId {
-        default_shard_id(&self.public_key, self.shards.len(), chain_id)
+        default_shard_id(&self.public_key, self.num_base_shards(), chain_id)
     }
 
     /// Returns the [`ShardConfig`] for the given shard id.

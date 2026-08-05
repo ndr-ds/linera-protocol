@@ -253,7 +253,22 @@ impl StorageServer {
     version = linera_version::VersionInfo::default_clap_str(),
     about = "A server providing storage service",
 )]
-enum StorageServerOptions {
+struct StorageServerOptions {
+    /// Subcommand selecting the storage backend.
+    #[command(subcommand)]
+    command: StorageServerCommand,
+
+    /// The number of Tokio worker threads to use.
+    #[arg(long, env = "LINERA_STORAGE_SERVER_TOKIO_THREADS")]
+    tokio_threads: Option<usize>,
+
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_STORAGE_SERVER_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
+}
+
+#[derive(clap::Parser)]
+enum StorageServerCommand {
     #[command(name = "memory")]
     Memory {
         /// The storage namespace.
@@ -597,8 +612,33 @@ impl StorageService for StorageServer {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let options = <StorageServerOptions as clap::Parser>::parse();
+
+    let mut runtime = if options.tokio_threads == Some(1) {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+
+        if let Some(threads) = options.tokio_threads {
+            builder.worker_threads(threads);
+        }
+
+        builder
+    };
+
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
+    runtime
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime")
+        .block_on(run(options.command))
+}
+
+async fn run(command: StorageServerCommand) {
     let env_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
         .from_env_lossy();
@@ -634,9 +674,8 @@ async fn main() {
         .with_env_filter(env_filter)
         .init();
 
-    let options = <StorageServerOptions as clap::Parser>::parse();
-    let (store, endpoint) = match options {
-        StorageServerOptions::Memory {
+    let (store, endpoint) = match command {
+        StorageServerCommand::Memory {
             namespace,
             endpoint,
         } => {
@@ -652,7 +691,7 @@ async fn main() {
         }
 
         #[cfg(with_rocksdb)]
-        StorageServerOptions::RocksDb {
+        StorageServerCommand::RocksDb {
             namespace,
             endpoint,
             path,

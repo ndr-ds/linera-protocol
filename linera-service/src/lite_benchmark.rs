@@ -94,9 +94,18 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     chains: Vec<ChainId>,
 
-    /// Target number of blocks per second, summed across all benchmarked chains.
+    /// Target number of blocks per second, summed across all benchmarked chains. Ignored if
+    /// --bps-schedule is given.
     #[arg(long, default_value = "1")]
     bps: usize,
+
+    /// A time-varying target rate instead of a fixed --bps: comma-separated
+    /// `offset_seconds:bps` pairs (e.g. "0:50,30:50,30:800,120:800,150:50"), each giving the
+    /// total bps (summed across all benchmarked chains, evenly split) from that offset until
+    /// the next one. Must start at offset 0. Re-evaluated a few times a second, so a rate
+    /// change takes effect within roughly a tick of its offset, not instantly.
+    #[arg(long)]
+    bps_schedule: Option<String>,
 
     /// Number of operations to include in each block.
     #[arg(long, default_value = "1")]
@@ -104,9 +113,19 @@ struct Args {
 
     /// The cross-chain traffic pattern: independent (self-transfers only, the default),
     /// mixed (half self, half spread across the other benchmarked chains), or full (always a
-    /// different benchmarked chain). `mixed` and `full` require at least 2 chains.
+    /// different benchmarked chain). `mixed` and `full` require at least 2 chains (across
+    /// --chains and --destination-chains).
     #[arg(long, value_enum, default_value_t = TrafficMode::Independent)]
     traffic_mode: TrafficMode,
+
+    /// Extra chains to address mixed/full traffic-mode messages to, in addition to --chains,
+    /// without giving them their own run_chain task -- no traffic ever originates from them,
+    /// so they don't consume any of the actively-benchmarked chains' shard capacity. Useful
+    /// for isolating a single actively-driven chain/worker while still exercising
+    /// cross-chain sends; their inboxes are simply left unprocessed. Must already exist
+    /// (e.g. via `linera benchmark single`) like any other chain.
+    #[arg(long, value_delimiter = ',')]
+    destination_chains: Vec<ChainId>,
 
     /// If set, stop after this many seconds.
     #[arg(long)]
@@ -148,12 +167,16 @@ async fn main() -> Result<()> {
         args.chains.clone()
     };
     anyhow::ensure!(!chain_ids.is_empty(), "no chains to benchmark");
+
+    // Destinations for mixed/full traffic modes: the actively-driven chains themselves, plus
+    // any purely-passive destination chains from --destination-chains (see its doc comment).
+    let mut all_chain_ids = chain_ids.clone();
+    all_chain_ids.extend(args.destination_chains.iter().copied());
     anyhow::ensure!(
-        chain_ids.len() > 1 || matches!(args.traffic_mode, TrafficMode::Independent),
-        "traffic-mode {:?} requires at least 2 chains",
+        all_chain_ids.len() > 1 || matches!(args.traffic_mode, TrafficMode::Independent),
+        "traffic-mode {:?} requires at least 2 chains (across --chains and --destination-chains)",
         args.traffic_mode
     );
-    let all_chain_ids = chain_ids.clone();
 
     let mut chain_clients = Vec::new();
     for chain_id in chain_ids {
@@ -187,20 +210,41 @@ async fn main() -> Result<()> {
     }
 
     let num_chains = chain_clients.len();
-    let bps_initial_share = args.bps / num_chains;
-    let mut bps_remainder = args.bps % num_chains;
     let success_count = Arc::new(AtomicUsize::new(0));
     let failure_count = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
+    // The current total bps (summed across all chains), read by every run_chain task each
+    // tick and divided evenly by num_chains. Fixed for the whole run unless --bps-schedule is
+    // given, in which case a background task updates it as the schedule progresses.
+    let current_bps = Arc::new(AtomicUsize::new(args.bps));
+    if let Some(spec) = &args.bps_schedule {
+        let schedule = parse_bps_schedule(spec)?;
+        info!(?schedule, "using a time-varying bps schedule");
+        let current_bps = current_bps.clone();
+        let shutdown = shutdown.clone();
+        task::spawn(async move {
+            let mut interval = time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let bps = schedule
+                            .iter()
+                            .rev()
+                            .find(|(offset, _)| (*offset as f64) <= elapsed)
+                            .map_or(0, |(_, bps)| *bps);
+                        current_bps.store(bps, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
     let mut join_set = task::JoinSet::new();
     for client in chain_clients {
-        let bps_share = if bps_remainder > 0 {
-            bps_remainder -= 1;
-            bps_initial_share + 1
-        } else {
-            bps_initial_share
-        };
+        let current_bps = current_bps.clone();
         let shutdown = shutdown.clone();
         let success_count = success_count.clone();
         let failure_count = failure_count.clone();
@@ -236,7 +280,8 @@ async fn main() -> Result<()> {
             client,
             generator,
             owner,
-            bps_share,
+            current_bps,
+            num_chains,
             transactions_per_block,
             shutdown,
             success_count,
@@ -281,6 +326,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Parses a `--bps-schedule` spec ("offset_seconds:bps,offset_seconds:bps,...") into a
+/// sorted list of breakpoints. Must be non-empty and start at offset 0.
+fn parse_bps_schedule(spec: &str) -> Result<Vec<(u64, usize)>> {
+    let mut schedule = Vec::new();
+    for part in spec.split(',') {
+        let (offset_str, bps_str) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid --bps-schedule entry {part:?}, expected offset:bps"))?;
+        let offset: u64 = offset_str
+            .parse()
+            .with_context(|| format!("invalid offset in --bps-schedule entry {part:?}"))?;
+        let bps: usize = bps_str
+            .parse()
+            .with_context(|| format!("invalid bps in --bps-schedule entry {part:?}"))?;
+        schedule.push((offset, bps));
+    }
+    schedule.sort_by_key(|(offset, _)| *offset);
+    anyhow::ensure!(!schedule.is_empty(), "--bps-schedule must not be empty");
+    anyhow::ensure!(schedule[0].0 == 0, "--bps-schedule's first offset must be 0");
+    Ok(schedule)
+}
+
 /// Writes one row per committed/failed block, matching `linera-paper-eval`'s `transfers.csv`
 /// schema (a subset of its columns -- this tool has no notion of experiment/network_config/
 /// repetition/phase, so those are omitted).
@@ -306,7 +373,8 @@ async fn run_chain(
     mut client: LiteChainClient,
     mut generator: NativeFungibleTransferGenerator,
     owner: AccountOwner,
-    bps: usize,
+    current_bps: Arc<AtomicUsize>,
+    num_chains: usize,
     transactions_per_block: usize,
     shutdown: CancellationToken,
     success_count: Arc<AtomicUsize>,
@@ -315,18 +383,36 @@ async fn run_chain(
 ) -> Result<Vec<BlockRecord>> {
     let chain_id = client.chain_id;
     let mut records = Vec::new();
-    let mut interval = if bps > 0 {
-        Some(time::interval(Duration::from_secs_f64(1.0 / bps as f64)))
-    } else {
-        None
-    };
+    // The target rate can change over time (--bps-schedule), so the ticker is rebuilt
+    // whenever it does; `tokio::time::interval` is kept (rather than a plain per-iteration
+    // sleep) so a slow propose_and_commit still catches up on the next tick instead of
+    // silently under-achieving the target rate. Divides in f64, not usize: with many chains
+    // and a low total rate (e.g. 300 total / 31 clients / 10 chains), integer division could
+    // truncate an intended-nonzero rate to exactly 0, silently stopping this chain's traffic
+    // forever (until the schedule moves to a large-enough rate again) instead of just ticking
+    // slowly.
+    let mut ticking_at = 0.0_f64;
+    let mut interval: Option<time::Interval> = None;
     loop {
         if shutdown.is_cancelled() {
             break;
         }
-        if let Some(interval) = &mut interval {
-            interval.tick().await;
+        let bps = current_bps.load(Ordering::Relaxed) as f64 / num_chains.max(1) as f64;
+        if bps != ticking_at {
+            ticking_at = bps;
+            interval = if bps > 0.0 {
+                Some(time::interval(Duration::from_secs_f64(1.0 / bps)))
+            } else {
+                None
+            };
         }
+        match &mut interval {
+            Some(interval) => interval.tick().await,
+            None => {
+                time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let operations = generator.generate_operations(owner, transactions_per_block);
         let num_tx = operations.len();
         let before = Instant::now();

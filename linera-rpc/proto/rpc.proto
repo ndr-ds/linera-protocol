@@ -55,6 +55,13 @@ service ValidatorWorker {
 
   // Return the worker's current routing table entry for a chain. (admin)
   rpc GetShardAssignment(ChainId) returns (ShardAssignmentUpdate);
+
+  // Return (and reset) the per-chain request counters accumulated since the
+  // previous report. Used by the validator manager as its load signal. (admin)
+  rpc GetLoadReport(google.protobuf.Empty) returns (LoadReport);
+
+  // Return all non-default entries of the worker's routing table. (admin)
+  rpc ListShardAssignments(google.protobuf.Empty) returns (ShardAssignmentList);
 }
 
 // How to communicate with a validator or a local node.
@@ -193,6 +200,23 @@ message ShardInfo {
 message ShardAssignmentUpdate {
     ChainId chain_id = 1;
     uint64 shard_id = 2;
+}
+
+// All non-default entries of a worker's routing table.
+message ShardAssignmentList {
+    repeated ShardAssignmentUpdate entries = 1;
+}
+
+// The number of requests processed for one chain since the previous report.
+message ChainLoad {
+    ChainId chain_id = 1;
+    uint64 requests = 2;
+}
+
+// Per-chain request counts processed by a worker since the previous report.
+message LoadReport {
+    uint64 shard_id = 1;
+    repeated ChainLoad loads = 2;
 }
 
 // A request for client to subscribe to notifications for a given `ChainId`

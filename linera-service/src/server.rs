@@ -370,6 +370,13 @@ struct ValidatorOptions {
     /// The public name and the port of each of the shards
     shards: Vec<ShardConfig>,
 
+    /// The number of base shards receiving default (hash-based) chain
+    /// assignments. Shards beyond this prefix are elastic slots that only
+    /// serve explicitly migrated chains and whose workers can be started and
+    /// stopped at runtime by the validator manager. Defaults to all shards.
+    #[serde(default)]
+    num_base_shards: Option<usize>,
+
     /// The name and the port of the proxies
     proxies: Vec<ProxyConfig>,
 }
@@ -391,6 +398,7 @@ fn make_server_config<R: CryptoRng>(
         public_key,
         protocol: options.internal_protocol,
         shards: options.shards,
+        base_shards: options.num_base_shards,
         block_exporters: options.block_exporters,
         proxies: options.proxies,
     };
@@ -547,6 +555,55 @@ enum ServerCommand {
         from_shard: Option<usize>,
     },
 
+    /// Runs the validator manager: periodically collects per-chain load
+    /// reports from all workers and migrates chains between workers to keep
+    /// their load balanced. With `--spawn-command`, it also starts workers for
+    /// elastic shard slots under load spikes and stops them again when they
+    /// have been idle for a while.
+    #[command(name = "manager")]
+    Manager {
+        /// Path to the file containing the server configuration of this Linera validator.
+        #[arg(long = "server")]
+        server_config_path: PathBuf,
+
+        /// How often (in milliseconds) load is collected and the policy is evaluated.
+        #[arg(long = "interval-ms", default_value = "2000", value_parser = util::parse_millis)]
+        interval: Duration,
+
+        /// Per-worker request rate (requests/sec) above which a worker is
+        /// considered overloaded.
+        #[arg(long, default_value_t = 500.0)]
+        high_watermark: f64,
+
+        /// Per-worker request rate (requests/sec) below which an elastic
+        /// worker is considered idle. Defaults to a quarter of the high
+        /// watermark.
+        #[arg(long)]
+        low_watermark: Option<f64>,
+
+        /// Maximum number of chain migrations executed per round.
+        #[arg(long, default_value_t = 8)]
+        max_migrations_per_round: usize,
+
+        /// Number of consecutive idle rounds before an elastic worker is
+        /// drained and stopped.
+        #[arg(long, default_value_t = 5)]
+        scale_down_rounds: usize,
+
+        /// Number of rounds without further scale actions after starting or
+        /// stopping a worker.
+        #[arg(long, default_value_t = 3)]
+        cooldown_rounds: usize,
+
+        /// Command used to start the worker for an elastic shard slot; every
+        /// occurrence of `{shard}` is replaced by the shard number, e.g.
+        /// `"linera-server run --server server.json --storage ... --shard {shard}"`.
+        /// If not provided, the manager only rebalances chains across
+        /// already-running workers.
+        #[arg(long)]
+        spawn_command: Option<String>,
+    },
+
     /// Replaces the configurations of the shards by following the given template.
     #[command(name = "edit-shards")]
     EditShards {
@@ -574,6 +631,13 @@ enum ServerCommand {
         /// shard number.
         #[arg(long)]
         metrics_port: Option<String>,
+
+        /// The number of base shards receiving default (hash-based) chain
+        /// assignments. Shards beyond this prefix become elastic slots that the
+        /// validator manager can start and stop at runtime. If not provided,
+        /// all shards are base shards.
+        #[arg(long)]
+        base_shards: Option<usize>,
     },
 }
 
@@ -612,7 +676,8 @@ fn otlp_exporter_endpoint_for(command: &ServerCommand) -> Option<&str> {
         } => otlp_exporter_endpoint.as_deref(),
         ServerCommand::Generate { .. }
         | ServerCommand::EditShards { .. }
-        | ServerCommand::MigrateChain { .. } => None,
+        | ServerCommand::MigrateChain { .. }
+        | ServerCommand::Manager { .. } => None,
     }
 }
 
@@ -637,6 +702,13 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
         ServerCommand::Generate { .. }
         | ServerCommand::EditShards { .. }
         | ServerCommand::MigrateChain { .. } => "server".into(),
+        ServerCommand::Manager {
+            server_config_path, ..
+        } => {
+            let server_config: ValidatorServerConfig =
+                util::read_json(server_config_path).expect("Failed to read server config");
+            format!("validator-{}-manager", server_config.validator.public_key).into()
+        }
     }
 }
 
@@ -754,7 +826,7 @@ async fn run(options: ServerOptions) {
         } => {
             let server_config: ValidatorServerConfig =
                 util::read_json(&server_config_path).expect("Failed to read server config");
-            migrate_chain(
+            linera_service::manager::migrate_chain(
                 &server_config.internal_network,
                 chain_id,
                 to_shard,
@@ -764,153 +836,65 @@ async fn run(options: ServerOptions) {
             .expect("Failed to migrate chain");
         }
 
+        ServerCommand::Manager {
+            server_config_path,
+            interval,
+            high_watermark,
+            low_watermark,
+            max_migrations_per_round,
+            scale_down_rounds,
+            cooldown_rounds,
+            spawn_command,
+        } => {
+            let server_config: ValidatorServerConfig =
+                util::read_json(&server_config_path).expect("Failed to read server config");
+            let config = linera_service::manager::ManagerConfig {
+                interval,
+                high_watermark,
+                low_watermark: low_watermark.unwrap_or(high_watermark / 4.0),
+                max_migrations_per_round,
+                scale_down_rounds,
+                cooldown_rounds,
+                spawn_command: spawn_command
+                    .map(|command| command.split_whitespace().map(String::from).collect()),
+            };
+            let manager =
+                linera_service::manager::Manager::new(server_config.internal_network, config)
+                    .expect("Invalid manager configuration");
+            let shutdown_notifier = CancellationToken::new();
+            tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
+            manager
+                .run(shutdown_notifier)
+                .await
+                .expect("Validator manager failed");
+        }
+
         ServerCommand::EditShards {
             server_config_path,
             num_shards,
             host,
             port,
             metrics_port,
+            base_shards,
         } => {
             let mut server_config =
                 persistent::File::<ValidatorServerConfig>::read(&server_config_path)
                     .expect("Failed to read server config");
             let shards = generate_shard_configs(&num_shards, &host, &port, &metrics_port)
                 .expect("Failed to generate shard configs");
+            if let Some(base_shards) = base_shards {
+                assert!(
+                    base_shards > 0 && base_shards <= shards.len(),
+                    "base shards must be between 1 and the number of shards"
+                );
+            }
             server_config.internal_network.shards = shards;
+            server_config.internal_network.base_shards = base_shards;
             Persist::persist(&mut server_config)
                 .await
                 .expect("Failed to write updated server config");
         }
     }
-}
-
-/// Orchestrates the runtime migration of a chain between two shards (workers)
-/// of the same validator.
-///
-/// The protocol is: (1) the source worker drains in-flight work for the chain
-/// and releases ownership, (2) the target worker takes ownership and persists
-/// the new assignment to the validator's shared storage, (3) the remaining
-/// workers and the proxies are notified of the routing change. Workers forward
-/// misrouted requests to the current owner, so a failed notification degrades
-/// performance for the affected chain but not correctness. Migrations are
-/// expected to be issued one at a time.
-async fn migrate_chain(
-    network: &ValidatorInternalNetworkConfig,
-    chain_id: ChainId,
-    to_shard: usize,
-    from_shard: Option<usize>,
-) -> anyhow::Result<()> {
-    use linera_rpc::grpc::api::{
-        self, notifier_service_client::NotifierServiceClient,
-        validator_worker_client::ValidatorWorkerClient,
-    };
-
-    anyhow::ensure!(
-        matches!(network.protocol, NetworkProtocol::Grpc(_)),
-        "chain migration requires the gRPC internal protocol"
-    );
-    anyhow::ensure!(
-        to_shard < network.shards.len(),
-        "shard {to_shard} does not exist; validator has {} shards",
-        network.shards.len()
-    );
-
-    let worker_client = |shard: usize| {
-        let address = network.shard(shard).http_address();
-        async move {
-            ValidatorWorkerClient::connect(address.clone())
-                .await
-                .with_context(|| format!("failed to connect to worker for shard {shard}"))
-        }
-    };
-
-    // Resolve the source shard from the target worker's routing table if it was
-    // not provided explicitly.
-    let from_shard = match from_shard {
-        Some(shard) => shard,
-        None => {
-            let mut client = worker_client(to_shard).await?;
-            let assignment = client
-                .get_shard_assignment(api::ChainId::from(chain_id))
-                .await
-                .context("failed to query current shard assignment")?
-                .into_inner();
-            usize::try_from(assignment.shard_id)
-                .context("target worker reported an invalid shard assignment")?
-        }
-    };
-    anyhow::ensure!(
-        from_shard != to_shard,
-        "chain {chain_id} is already assigned to shard {to_shard}"
-    );
-    anyhow::ensure!(
-        from_shard < network.shards.len(),
-        "shard {from_shard} does not exist; validator has {} shards",
-        network.shards.len()
-    );
-    info!("Migrating chain {chain_id} from shard {from_shard} to shard {to_shard}");
-
-    let update = api::ShardAssignmentUpdate {
-        chain_id: Some(chain_id.into()),
-        shard_id: to_shard as u64,
-    };
-
-    // Step 1: the source worker drains and releases the chain.
-    let mut source = worker_client(from_shard).await?;
-    source
-        .release_chain(update.clone())
-        .await
-        .context("source worker failed to release the chain")?;
-    info!("Shard {from_shard} released chain {chain_id}");
-
-    // Step 2: the target worker takes ownership and persists the assignment.
-    let mut target = worker_client(to_shard).await?;
-    target
-        .acquire_chain(update.clone())
-        .await
-        .context("target worker failed to acquire the chain")?;
-    info!("Shard {to_shard} acquired chain {chain_id}");
-
-    // Step 3: notify the remaining workers, for cross-chain request routing.
-    for shard in 0..network.shards.len() {
-        if shard == from_shard || shard == to_shard {
-            continue;
-        }
-        let result = async {
-            let mut client = worker_client(shard).await?;
-            client.update_shard_assignment(update.clone()).await?;
-            anyhow::Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            error!(
-                "Failed to notify shard {shard} of the new assignment: {error}. \
-                 Its requests for chain {chain_id} will be forwarded by shard {from_shard}."
-            );
-        }
-    }
-
-    // Step 4: notify the proxies, for client request routing.
-    for (id, proxy) in network.proxies.iter().enumerate() {
-        let address = proxy.internal_address(&network.protocol);
-        let result = async {
-            let mut client = NotifierServiceClient::connect(address.clone())
-                .await
-                .with_context(|| format!("failed to connect to proxy {id} at {address}"))?;
-            client.update_shard_assignment(update.clone()).await?;
-            anyhow::Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            error!(
-                "Failed to notify proxy {id} of the new assignment: {error}. \
-                 Its requests for chain {chain_id} will be forwarded by shard {from_shard}."
-            );
-        }
-    }
-
-    info!("Chain {chain_id} migrated to shard {to_shard}");
-    Ok(())
 }
 
 fn generate_shard_configs(
@@ -1017,6 +1001,7 @@ mod test {
                         metrics_port: Some(5002),
                     },
                 ],
+                num_base_shards: None,
             }
         );
     }
