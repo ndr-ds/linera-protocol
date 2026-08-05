@@ -37,6 +37,7 @@ async-graphql.workspace = true
 async-lock.workspace = true
 bcs.workspace = true
 convert_case.workspace = true
+crossbeam-skiplist.workspace = true
 custom_debug_derive.workspace = true
 derive_more = { workspace = true, features = ["from"] }
 futures.workspace = true

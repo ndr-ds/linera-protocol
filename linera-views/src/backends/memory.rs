@@ -5,9 +5,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, LazyLock, Mutex, RwLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
+use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -30,13 +31,20 @@ pub struct MemoryStoreConfig {
     pub kill_on_drop: bool,
 }
 
-/// The values in a partition.
-type MemoryStoreMap = BTreeMap<Vec<u8>, Vec<u8>>;
+/// The values in a partition. A lock-free, sorted map: reads, writes and ordered range
+/// scans on different keys proceed concurrently without blocking each other -- unlike a
+/// single `RwLock<BTreeMap<..>>`, where a `write_batch` blocks every concurrent reader of
+/// the same chain for the duration of the whole batch. Note this means `write_batch` is no
+/// longer atomic with respect to concurrent readers: a reader racing a batch may observe
+/// some of its writes but not others. Linera only ever has one writer per chain at a time
+/// (block execution is sequential per chain), so this doesn't allow writes to race each
+/// other; it only affects a reader that overlaps a concurrent write.
+type MemoryStoreMap = SkipMap<Vec<u8>, Vec<u8>>;
 
 /// The container for the `MemoryStoreMap`s by namespace and then root key
 #[derive(Default)]
 struct MemoryDatabases {
-    databases: BTreeMap<String, BTreeMap<Vec<u8>, Arc<RwLock<MemoryStoreMap>>>>,
+    databases: BTreeMap<String, BTreeMap<Vec<u8>, Arc<MemoryStoreMap>>>,
 }
 
 /// A connection to a namespace of key-values in memory.
@@ -57,10 +65,9 @@ impl MemoryDatabases {
         let Some(stores) = self.databases.get_mut(namespace) else {
             return Err(MemoryStoreError::NamespaceNotFound);
         };
-        let store = stores.entry(root_key.to_vec()).or_insert_with(|| {
-            let map = MemoryStoreMap::new();
-            Arc::new(RwLock::new(map))
-        });
+        let store = stores
+            .entry(root_key.to_vec())
+            .or_insert_with(|| Arc::new(MemoryStoreMap::new()));
         let map = store.clone();
         Ok(MemoryStore {
             map,
@@ -101,7 +108,7 @@ static MEMORY_DATABASES: LazyLock<Mutex<MemoryDatabases>> =
 #[derive(Clone)]
 pub struct MemoryStore {
     /// The map used for storing the data.
-    map: Arc<RwLock<MemoryStoreMap>>,
+    map: Arc<MemoryStoreMap>,
     /// The root key.
     root_key: Vec<u8>,
 }
@@ -122,29 +129,17 @@ impl ReadableKeyValueStore for MemoryStore {
     }
 
     async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
-        Ok(map.get(key).cloned())
+        Ok(self.map.get(key).map(|entry| entry.value().clone()))
     }
 
     async fn contains_key(&self, key: &[u8]) -> Result<bool, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
-        Ok(map.contains_key(key))
+        Ok(self.map.contains_key(key))
     }
 
     async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
         Ok(keys
             .iter()
-            .map(|key| map.contains_key(key))
+            .map(|key| self.map.contains_key(key.as_slice()))
             .collect::<Vec<_>>())
     }
 
@@ -152,13 +147,13 @@ impl ReadableKeyValueStore for MemoryStore {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
         let mut result = Vec::new();
         for key in keys {
-            result.push(map.get(key).cloned());
+            result.push(
+                self.map
+                    .get(key.as_slice())
+                    .map(|entry| entry.value().clone()),
+            );
         }
         Ok(result)
     }
@@ -167,14 +162,13 @@ impl ReadableKeyValueStore for MemoryStore {
         &self,
         key_prefix: &[u8],
     ) -> Result<Vec<Vec<u8>>, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
         let mut values = Vec::new();
         let len = key_prefix.len();
-        for (key, _value) in map.range(get_key_range_for_prefix(key_prefix.to_vec())) {
-            values.push(key[len..].to_vec())
+        for entry in self
+            .map
+            .range(get_key_range_for_prefix(key_prefix.to_vec()))
+        {
+            values.push(entry.key()[len..].to_vec())
         }
         Ok(values)
     }
@@ -183,14 +177,13 @@ impl ReadableKeyValueStore for MemoryStore {
         &self,
         key_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MemoryStoreError> {
-        let map = self
-            .map
-            .read()
-            .expect("MemoryStore lock should not be poisoned");
         let mut key_values = Vec::new();
         let len = key_prefix.len();
-        for (key, value) in map.range(get_key_range_for_prefix(key_prefix.to_vec())) {
-            let key_value = (key[len..].to_vec(), value.to_vec());
+        for entry in self
+            .map
+            .range(get_key_range_for_prefix(key_prefix.to_vec()))
+        {
+            let key_value = (entry.key()[len..].to_vec(), entry.value().clone());
             key_values.push(key_value);
         }
         Ok(key_values)
@@ -201,25 +194,22 @@ impl WritableKeyValueStore for MemoryStore {
     const MAX_VALUE_SIZE: usize = usize::MAX;
 
     async fn write_batch(&self, batch: Batch) -> Result<(), MemoryStoreError> {
-        let mut map = self
-            .map
-            .write()
-            .expect("MemoryStore lock should not be poisoned");
         for ent in batch.operations {
             match ent {
                 WriteOperation::Put { key, value } => {
-                    map.insert(key, value);
+                    self.map.insert(key, value);
                 }
                 WriteOperation::Delete { key } => {
-                    map.remove(&key);
+                    self.map.remove(key.as_slice());
                 }
                 WriteOperation::DeletePrefix { key_prefix } => {
-                    let key_list = map
+                    let key_list = self
+                        .map
                         .range(get_key_range_for_prefix(key_prefix))
-                        .map(|x| x.0.to_vec())
+                        .map(|entry| entry.key().clone())
                         .collect::<Vec<_>>();
                     for key in key_list {
-                        map.remove(&key);
+                        self.map.remove(key.as_slice());
                     }
                 }
             }
@@ -237,7 +227,7 @@ impl MemoryStore {
     #[cfg(with_testing)]
     pub fn new_for_testing() -> Self {
         Self {
-            map: Arc::default(),
+            map: Arc::new(MemoryStoreMap::new()),
             root_key: Vec::new(),
         }
     }
