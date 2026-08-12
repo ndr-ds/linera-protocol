@@ -21,7 +21,7 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::Write as _,
     path::PathBuf,
     sync::{
@@ -57,6 +57,7 @@ use linera_execution::committee::Committee;
 use linera_rpc::{node_provider::DEFAULT_MAX_BACKOFF, Client, NodeOptions, NodeProvider};
 use linera_wallet_json::{Keystore, PersistentWallet};
 use num_format::{Locale, ToFormattedString as _};
+use rand::Rng as _;
 use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -107,9 +108,25 @@ struct Args {
     #[arg(long)]
     bps_schedule: Option<String>,
 
-    /// Number of operations to include in each block.
+    /// Number of operations to include in each block. Ignored if
+    /// --transactions-per-block-file is given.
     #[arg(long, default_value = "1")]
     transactions_per_block: usize,
+
+    /// Path to a file with one block size (number of transactions) per line, e.g. the
+    /// per-block transaction counts of a real Ethereum trace. If given, every block's size is
+    /// taken from this sequence instead of --transactions-per-block: each chain starts at its
+    /// own offset (offsets are spread randomly over the sequence, so the chains don't all
+    /// propose identically-sized blocks at the same time) and then walks it one entry per
+    /// block, wrapping around forever. Blank lines and lines starting with `#` are ignored.
+    #[arg(long)]
+    transactions_per_block_file: Option<PathBuf>,
+
+    /// Scaling factor applied to every entry of --transactions-per-block-file: 0.5 halves
+    /// each block, 2.0 doubles it. Scaled sizes are rounded to the nearest integer and
+    /// clamped to at least 1, since validators reject empty blocks.
+    #[arg(long, default_value = "1.0")]
+    transactions_per_block_scale: f64,
 
     /// The cross-chain traffic pattern: independent (self-transfers only, the default),
     /// mixed (half self, half spread across the other benchmarked chains), or full (always a
@@ -209,6 +226,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    let block_sizes = match &args.transactions_per_block_file {
+        None => None,
+        Some(path) => {
+            let contents = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let sizes = parse_block_sizes(&contents, args.transactions_per_block_scale)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            let total: usize = sizes.iter().sum();
+            info!(
+                entries = sizes.len(),
+                min = sizes.iter().min(),
+                max = sizes.iter().max(),
+                mean = total as f64 / sizes.len() as f64,
+                "using a block-size sequence from {}",
+                path.display(),
+            );
+            Some(Arc::new(sizes))
+        }
+    };
+
     let num_chains = chain_clients.len();
     let success_count = Arc::new(AtomicUsize::new(0));
     let failure_count = Arc::new(AtomicUsize::new(0));
@@ -275,7 +312,16 @@ async fn main() -> Result<()> {
         let generator =
             NativeFungibleTransferGenerator::new(chain_id, destinations, true, avoid_self)
                 .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
-        let transactions_per_block = args.transactions_per_block;
+        // Either the same size for every block, or this chain's own random starting offset
+        // into the shared block-size sequence, so that chains proposing at the same instant
+        // don't all pick the same entry.
+        let block_sizer = match &block_sizes {
+            None => BlockSizer::Fixed(args.transactions_per_block),
+            Some(sizes) => BlockSizer::Sequence {
+                index: rand::thread_rng().gen_range(0..sizes.len()),
+                sizes: sizes.clone(),
+            },
+        };
         // Spread each chain's first tick uniformly at random over one period of its own share
         // of the target rate, so e.g. 100 chains at a combined 50 bps don't all wake up and
         // propose a block in the same instant every 2 seconds. Based on the rate at spawn time
@@ -291,7 +337,7 @@ async fn main() -> Result<()> {
             owner,
             current_bps,
             num_chains,
-            transactions_per_block,
+            block_sizer,
             shutdown,
             success_count,
             failure_count,
@@ -358,6 +404,36 @@ fn parse_bps_schedule(spec: &str) -> Result<Vec<(u64, usize)>> {
     Ok(schedule)
 }
 
+/// Parses the contents of a `--transactions-per-block-file`: one block size per line, with
+/// blank lines and `#` comments ignored. Every size is multiplied by `scale`, rounded to the
+/// nearest integer, and clamped to at least 1, since validators reject empty blocks.
+fn parse_block_sizes(contents: &str, scale: f64) -> Result<Vec<usize>> {
+    anyhow::ensure!(
+        scale.is_finite() && scale > 0.0,
+        "--transactions-per-block-scale must be a positive number, got {scale}"
+    );
+    let mut sizes = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let size: usize = line
+            .parse()
+            .with_context(|| format!("invalid block size {line:?} on line {}", index + 1))?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the product is non-negative, and clamped below to a block size that is \
+                      already far beyond anything a validator will accept"
+        )]
+        let scaled = (size as f64 * scale).round().clamp(1.0, u32::MAX as f64) as usize;
+        sizes.push(scaled);
+    }
+    anyhow::ensure!(!sizes.is_empty(), "the block size file has no entries");
+    Ok(sizes)
+}
+
 /// Writes one row per committed/failed block, matching `linera-paper-eval`'s `transfers.csv`
 /// schema (a subset of its columns -- this tool has no notion of experiment/network_config/
 /// repetition/phase, so those are omitted).
@@ -378,6 +454,30 @@ fn write_records_csv(path: &std::path::Path, records: &[BlockRecord]) -> Result<
     Ok(())
 }
 
+/// Decides how many transactions the next block gets: either always the same number, or the
+/// next entry of a shared sequence (see `--transactions-per-block-file`), cycled forever from
+/// this chain's own starting offset.
+enum BlockSizer {
+    Fixed(usize),
+    Sequence {
+        sizes: Arc<Vec<usize>>,
+        index: usize,
+    },
+}
+
+impl BlockSizer {
+    fn next_size(&mut self) -> usize {
+        match self {
+            BlockSizer::Fixed(size) => *size,
+            BlockSizer::Sequence { sizes, index } => {
+                let size = sizes[*index];
+                *index = (*index + 1) % sizes.len();
+                size
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chain(
     mut client: LiteChainClient,
@@ -385,7 +485,7 @@ async fn run_chain(
     owner: AccountOwner,
     current_bps: Arc<AtomicUsize>,
     num_chains: usize,
-    transactions_per_block: usize,
+    mut block_sizer: BlockSizer,
     shutdown: CancellationToken,
     success_count: Arc<AtomicUsize>,
     failure_count: Arc<AtomicUsize>,
@@ -433,7 +533,7 @@ async fn run_chain(
                 continue;
             }
         };
-        let operations = generator.generate_operations(owner, transactions_per_block);
+        let operations = generator.generate_operations(owner, block_sizer.next_size());
         let num_tx = operations.len();
         let before = Instant::now();
         let outcome = client.propose_and_commit(operations).await;
@@ -693,6 +793,33 @@ mod tests {
                 value_hash,
             ),
         }
+    }
+
+    #[test]
+    fn block_sizes_are_scaled_and_never_zero() {
+        let contents = "# a comment\n100\n\n  3 \n0\n";
+        assert_eq!(parse_block_sizes(contents, 1.0).unwrap(), vec![100, 3, 1]);
+        // 3 * 0.5 rounds to 2, and 0 is clamped up to 1: validators reject empty blocks.
+        assert_eq!(parse_block_sizes(contents, 0.5).unwrap(), vec![50, 2, 1]);
+        assert_eq!(parse_block_sizes(contents, 2.0).unwrap(), vec![200, 6, 1]);
+
+        assert!(parse_block_sizes("12\nnot a number\n", 1.0).is_err());
+        assert!(parse_block_sizes("# nothing but comments\n", 1.0).is_err());
+        assert!(parse_block_sizes("12\n", 0.0).is_err());
+    }
+
+    #[test]
+    fn a_block_size_sequence_cycles_from_its_offset() {
+        let mut sizer = BlockSizer::Sequence {
+            sizes: Arc::new(vec![1, 2, 3]),
+            index: 2,
+        };
+        let sizes: Vec<_> = (0..5).map(|_| sizer.next_size()).collect();
+        assert_eq!(sizes, vec![3, 1, 2, 3, 1]);
+
+        let mut sizer = BlockSizer::Fixed(7);
+        assert_eq!(sizer.next_size(), 7);
+        assert_eq!(sizer.next_size(), 7);
     }
 
     #[test]
