@@ -276,6 +276,15 @@ async fn main() -> Result<()> {
             NativeFungibleTransferGenerator::new(chain_id, destinations, true, avoid_self)
                 .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
         let transactions_per_block = args.transactions_per_block;
+        // Spread each chain's first tick uniformly at random over one period of its own share
+        // of the target rate, so e.g. 100 chains at a combined 50 bps don't all wake up and
+        // propose a block in the same instant every 2 seconds. Based on the rate at spawn time
+        // only: it's just meant to break up the initial thundering herd, not to track
+        // --bps-schedule changes, and it disappears into the ordinary jitter of consensus
+        // round-trips within the first few ticks anyway.
+        let per_chain_bps = current_bps.load(Ordering::Relaxed) as f64 / num_chains.max(1) as f64;
+        let de_sync_sleep = (per_chain_bps > 0.0)
+            .then(|| Duration::from_secs_f64(rand::random::<f64>() / per_chain_bps));
         join_set.spawn(run_chain(
             client,
             generator,
@@ -287,6 +296,7 @@ async fn main() -> Result<()> {
             success_count,
             failure_count,
             start,
+            de_sync_sleep,
         ));
     }
 
@@ -380,7 +390,17 @@ async fn run_chain(
     success_count: Arc<AtomicUsize>,
     failure_count: Arc<AtomicUsize>,
     start: Instant,
+    de_sync_sleep: Option<Duration>,
 ) -> Result<Vec<BlockRecord>> {
+    // De-sync from every other chain's task before the first tick, so they don't all propose
+    // a block in lockstep (see the comment where this is computed, in `main`). This delays
+    // this chain's own first block by up to one of its periods, which slightly lowers the bps
+    // this chain contributes near the very start of the run; negligible over any realistic
+    // --runtime-in-seconds and outweighed by avoiding synchronized bursts against validators.
+    if let Some(de_sync_sleep) = de_sync_sleep {
+        time::sleep(de_sync_sleep).await;
+    }
+
     let chain_id = client.chain_id;
     let mut records = Vec::new();
     // The target rate can change over time (--bps-schedule), so the ticker is rebuilt
