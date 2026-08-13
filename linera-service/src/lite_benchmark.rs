@@ -146,6 +146,14 @@ struct Args {
     #[arg(long)]
     max_incoming_bundles_per_block: Option<usize>,
 
+    /// Send every transfer in a block to the same destination chain (chosen fresh each block),
+    /// instead of letting each transfer pick its own destination. All of a block's cross-chain
+    /// messages then land in one recipient's inbox as a run of separate single-message bundles.
+    /// Only affects `mixed`/`full` traffic modes. Off by default: transfers spread across
+    /// destinations.
+    #[arg(long)]
+    single_destination_per_block: bool,
+
     /// Extra chains to address mixed/full traffic-mode messages to, in addition to --chains,
     /// without giving them their own run_chain task -- no traffic ever originates from them,
     /// so they don't consume any of the actively-benchmarked chains' shard capacity. Useful
@@ -322,9 +330,13 @@ async fn main() -> Result<()> {
                 false,
             ),
         };
-        let generator =
-            NativeFungibleTransferGenerator::new(chain_id, destinations, true, avoid_self)
-                .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
+        let generator = NativeFungibleTransferGenerator::new(
+            chain_id,
+            destinations,
+            args.single_destination_per_block,
+            avoid_self,
+        )
+        .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
         // Either the same size for every block, or this chain's own random starting offset
         // into the shared block-size sequence, so that chains proposing at the same instant
         // don't all pick the same entry.
