@@ -20,7 +20,7 @@
 //! exchange that other rounds require.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::Write as _,
     path::PathBuf,
@@ -41,7 +41,7 @@ use linera_base::{
 };
 use linera_cache::ValueCache;
 use linera_chain::{
-    data_types::{BlockProposal, ProposedBlock, Transaction},
+    data_types::{BlockProposal, IncomingBundle, ProposedBlock, Transaction},
     justification::JustificationChain,
     types::{
         CertificateKind, CertificateValue as _, ConfirmedBlock, ConfirmedBlockCertificate,
@@ -135,6 +135,17 @@ struct Args {
     #[arg(long, value_enum, default_value_t = TrafficMode::Independent)]
     traffic_mode: TrafficMode,
 
+    /// The maximum number of incoming message bundles to drain into each block, on top of its
+    /// operations. In every mode except `independent`, each block first receives the messages
+    /// waiting in its chain's inboxes (the cross-chain transfers other chains sent it) so the
+    /// inboxes don't grow without bound; this caps how many bundles one block will absorb, so
+    /// a backlog is drained over several blocks rather than in one huge, slow block. Defaults
+    /// to twice that block's own operation count, which self-tunes with variable block sizes
+    /// and drains a backlog at twice the arrival rate. No effect in `independent` mode, which
+    /// never generates cross-chain messages.
+    #[arg(long)]
+    max_incoming_bundles_per_block: Option<usize>,
+
     /// Extra chains to address mixed/full traffic-mode messages to, in addition to --chains,
     /// without giving them their own run_chain task -- no traffic ever originates from them,
     /// so they don't consume any of the actively-benchmarked chains' shard capacity. Useful
@@ -149,8 +160,10 @@ struct Args {
     runtime_in_seconds: Option<u64>,
 
     /// If set, write one row per committed/failed block to this CSV path, with columns
-    /// chain_id,ts_within_experiment,num_tx,result,duration_micros -- matching
-    /// `linera-paper-eval`'s `transfers.csv` schema.
+    /// chain_id,ts_within_experiment,num_tx,num_bundles,result,duration_micros -- num_tx is
+    /// the block's operation count and num_bundles the incoming message bundles it drained
+    /// (see --max-incoming-bundles-per-block); a superset of `linera-paper-eval`'s
+    /// `transfers.csv` schema.
     #[arg(long)]
     output_csv: Option<PathBuf>,
 }
@@ -331,6 +344,10 @@ async fn main() -> Result<()> {
         let per_chain_bps = current_bps.load(Ordering::Relaxed) as f64 / num_chains.max(1) as f64;
         let de_sync_sleep = (per_chain_bps > 0.0)
             .then(|| Duration::from_secs_f64(rand::random::<f64>() / per_chain_bps));
+        // Only `independent` mode never produces cross-chain messages; in every other mode each
+        // block drains this chain's inboxes so they don't grow without bound (see
+        // --max-incoming-bundles-per-block).
+        let process_messages = !matches!(args.traffic_mode, TrafficMode::Independent);
         join_set.spawn(run_chain(
             client,
             generator,
@@ -338,6 +355,8 @@ async fn main() -> Result<()> {
             current_bps,
             num_chains,
             block_sizer,
+            process_messages,
+            args.max_incoming_bundles_per_block,
             shutdown,
             success_count,
             failure_count,
@@ -439,14 +458,18 @@ fn parse_block_sizes(contents: &str, scale: f64) -> Result<Vec<usize>> {
 /// repetition/phase, so those are omitted).
 fn write_records_csv(path: &std::path::Path, records: &[BlockRecord]) -> Result<()> {
     let mut file = File::create(path)?;
-    writeln!(file, "chain_id,ts_within_experiment,num_tx,result,duration_micros")?;
+    writeln!(
+        file,
+        "chain_id,ts_within_experiment,num_tx,num_bundles,result,duration_micros"
+    )?;
     for record in records {
         writeln!(
             file,
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{}",
             record.chain_id,
             record.elapsed_since_start.as_secs_f64(),
             record.num_tx,
+            record.num_bundles,
             record.result,
             record.duration.as_micros(),
         )?;
@@ -486,6 +509,8 @@ async fn run_chain(
     current_bps: Arc<AtomicUsize>,
     num_chains: usize,
     mut block_sizer: BlockSizer,
+    process_messages: bool,
+    max_incoming_bundles_per_block: Option<usize>,
     shutdown: CancellationToken,
     success_count: Arc<AtomicUsize>,
     failure_count: Arc<AtomicUsize>,
@@ -535,24 +560,32 @@ async fn run_chain(
         };
         let operations = generator.generate_operations(owner, block_sizer.next_size());
         let num_tx = operations.len();
+        // Cap the incoming bundles this block will drain: an explicit limit, or twice the
+        // block's own operation count, so a backlog is spread over several blocks instead of
+        // one huge one, and the cap tracks the (possibly variable) block size. Unused when
+        // `process_messages` is false.
+        let bundle_cap = max_incoming_bundles_per_block.unwrap_or_else(|| num_tx.saturating_mul(2));
         let before = Instant::now();
-        let outcome = client.propose_and_commit(operations).await;
+        let outcome = client
+            .propose_and_commit(operations, process_messages, bundle_cap)
+            .await;
         let duration = before.elapsed();
-        let result = match outcome {
-            Ok(()) => {
+        let (result, num_bundles) = match outcome {
+            Ok(num_bundles) => {
                 success_count.fetch_add(1, Ordering::Relaxed);
-                "committed"
+                ("committed", num_bundles)
             }
             Err(error) => {
                 warn!(%chain_id, %error, "failed to commit a block");
                 failure_count.fetch_add(1, Ordering::Relaxed);
-                "failed"
+                ("failed", 0)
             }
         };
         records.push(BlockRecord {
             chain_id,
             elapsed_since_start: before.saturating_duration_since(start),
             num_tx,
+            num_bundles,
             result,
             duration,
         });
@@ -567,6 +600,7 @@ struct BlockRecord {
     chain_id: ChainId,
     elapsed_since_start: Duration,
     num_tx: usize,
+    num_bundles: usize,
     result: &'static str,
     duration: Duration,
 }
@@ -583,6 +617,11 @@ struct LiteChainClient {
     committee: Committee,
     signer: InMemorySigner,
     value_cache: ValueCache<CryptoHash, ConfirmedBlockCertificate>,
+    /// The incoming message bundles to drain into the *next* block, computed as a side effect
+    /// of the previous block's confirmed-value fetch (see `propose_and_commit`). Held across
+    /// blocks so that draining costs no extra round trip; empty before the first block and in
+    /// `independent` mode.
+    pending_bundles: Vec<IncomingBundle>,
 }
 
 impl LiteChainClient {
@@ -609,6 +648,7 @@ impl LiteChainClient {
                         committee,
                         signer,
                         value_cache: ValueCache::new("lite-benchmark", 64, 60),
+                        pending_bundles: Vec::new(),
                     });
                 }
                 Err(error) => {
@@ -622,13 +662,41 @@ impl LiteChainClient {
     /// Builds, signs, and submits a block with the given operations, then drives it to a
     /// committed certificate. Uses `Round::Fast`, so this only works on chains owned by a
     /// single super owner.
+    ///
+    /// If `process_messages` is set, the block first drains up to `bundle_cap` incoming message
+    /// bundles from this chain's inboxes (as `Transaction::ReceiveMessages`, before the
+    /// operations), so the inboxes don't grow without bound in cross-chain traffic modes.
+    /// Returns the number of bundles that were included.
+    ///
+    /// The bundles come from `self.pending_bundles`, which the *previous* block's confirmed-value
+    /// fetch computed for us -- so draining costs no extra round trip. This is sound because a
+    /// block only removes its bundles from the validators' inboxes once it commits: the bundles
+    /// we carried over are still pending (nothing else drains this chain), and still present in
+    /// the validators that reported them, so the proposal is accepted. `self.pending_bundles` is
+    /// only refreshed after this block commits, so a failed block simply retries the same set.
     async fn propose_and_commit(
         &mut self,
         operations: Vec<linera_execution::Operation>,
-    ) -> Result<()> {
-        let transactions = operations
+        process_messages: bool,
+        bundle_cap: usize,
+    ) -> Result<usize> {
+        let bundles: Vec<IncomingBundle> = if process_messages {
+            self.pending_bundles.iter().take(bundle_cap).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let num_bundles = bundles.len();
+        // The bundles this block consumes, so the next block's pending set can exclude them (the
+        // confirmed-value fetch below sees them still in the inboxes, since our certificate has
+        // not been broadcast yet).
+        let consumed: HashSet<_> = bundles
+            .iter()
+            .map(|bundle| (bundle.origin, bundle.bundle.cursor()))
+            .collect();
+        let transactions = bundles
             .into_iter()
-            .map(Transaction::ExecuteOperation)
+            .map(Transaction::ReceiveMessages)
+            .chain(operations.into_iter().map(Transaction::ExecuteOperation))
             .collect();
         let block = ProposedBlock {
             chain_id: self.chain_id,
@@ -661,23 +729,12 @@ impl LiteChainClient {
         let (value_hash, signatures) = find_confirming_quorum(self.chain_id, votes, &self.committee)
             .context("no quorum of validators voted to confirm the proposed block")?;
 
-        // Fetch the confirmed value (with its real execution outcome) from any validator that
-        // has seen the proposal, instead of executing the block ourselves.
-        let mut confirmed_block: Option<ConfirmedBlock> = None;
-        for (_, node) in &self.nodes {
-            let mut query = ChainInfoQuery::new(self.chain_id);
-            query.request_manager_values = true;
-            if let Ok(response) = node.handle_chain_info_query(query).await {
-                if let Some(value) = response.info.manager.requested_confirmed {
-                    if value.hash() == value_hash {
-                        confirmed_block = Some(*value);
-                        break;
-                    }
-                }
-            }
-        }
-        let confirmed_block =
-            confirmed_block.context("could not fetch the confirmed block value")?;
+        // Fetch the confirmed value (with its real execution outcome) instead of executing the
+        // block ourselves, and -- folded into the same round trip -- the inboxes' pending
+        // bundles, from which we compute the set to drain into the *next* block.
+        let (confirmed_block, next_pending) = self
+            .fetch_confirmed_and_pending(value_hash, process_messages, &consumed)
+            .await?;
 
         // The vote's `first_round` attestation must be reproduced exactly, since it is part of
         // what every signature covers (see `Vote::new_with_first_round`); a single super owner's
@@ -722,8 +779,121 @@ impl LiteChainClient {
 
         self.previous_block_hash = Some(certificate.hash());
         self.height = self.height.try_add_one()?;
-        Ok(())
+        // Only now that the block committed (so its bundles are being removed from the inboxes)
+        // do we adopt the next pending set. On a failed block we keep `self.pending_bundles` as
+        // it was, so the next attempt retries the same, still-pending bundles.
+        self.pending_bundles = next_pending;
+        Ok(num_bundles)
     }
+
+    /// In one parallel round trip to every validator, fetches the confirmed block value for
+    /// `value_hash` (from any validator that has it) and, if `process_messages` is set, the
+    /// bundles to drain into the *next* block.
+    ///
+    /// The next pending set is the per-origin prefix that *every* responding validator agrees
+    /// on, minus `consumed` (the bundles this block is about to remove, which are still in the
+    /// inboxes at query time since our certificate has not been broadcast yet). We take only the
+    /// agreed prefix because certificates are delivered non-blocking, so the validators' inboxes
+    /// are not in lockstep: a bundle one validator already holds may not have reached another. A
+    /// proposal is rejected wholesale if it receives a bundle a validator lacks
+    /// (`MissingCrossChainUpdate`), and a given origin's bundles must be consumed in cursor order
+    /// (`IncorrectOrder`), so anything not yet everywhere is simply left for a later block. No
+    /// validator response is trusted for anything but which bundles exist; they are copied
+    /// verbatim into the block. The result is not capped here -- the cap is applied when the
+    /// bundles are actually included, so a backlog beyond one block's cap carries forward.
+    async fn fetch_confirmed_and_pending(
+        &self,
+        value_hash: CryptoHash,
+        process_messages: bool,
+        consumed: &HashSet<(ChainId, linera_base::data_types::Cursor)>,
+    ) -> Result<(ConfirmedBlock, Vec<IncomingBundle>)> {
+        let responses = join_all(self.nodes.iter().map(|(public_key, node)| {
+            let node = node.clone();
+            let mut query = ChainInfoQuery::new(self.chain_id);
+            query.request_manager_values = true;
+            if process_messages {
+                query = query.with_pending_message_bundles();
+            }
+            let public_key = *public_key;
+            async move {
+                match node.handle_chain_info_query(query).await {
+                    Ok(response) => Some(response.info),
+                    Err(error) => {
+                        warn!(%public_key, %error, "validator did not answer the confirmed-value query");
+                        None
+                    }
+                }
+            }
+        }))
+        .await;
+
+        let mut confirmed_block: Option<ConfirmedBlock> = None;
+        let mut per_node: Vec<Vec<IncomingBundle>> = Vec::new();
+        for info in responses.into_iter().flatten() {
+            if process_messages {
+                per_node.push(info.requested_pending_message_bundles);
+            }
+            if confirmed_block.is_none() {
+                if let Some(value) = info.manager.requested_confirmed {
+                    if value.hash() == value_hash {
+                        confirmed_block = Some(*value);
+                    }
+                }
+            }
+        }
+        let confirmed_block =
+            confirmed_block.context("could not fetch the confirmed block value")?;
+
+        let next_pending = if process_messages {
+            common_prefix_bundles(per_node)
+                .into_iter()
+                .filter(|bundle| !consumed.contains(&(bundle.origin, bundle.bundle.cursor())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok((confirmed_block, next_pending))
+    }
+}
+
+/// Given each responding validator's list of pending incoming bundles, returns the bundles that
+/// appear -- as an in-order per-origin prefix -- in *every* list. Bundles from one origin are
+/// FIFO by cursor, so for each origin this compares the lists element by element and keeps the
+/// longest common leading run; an origin missing from any list contributes nothing. Origins are
+/// visited in a deterministic (sorted) order. See `fetch_incoming_bundles` for why only this
+/// safe intersection is used.
+fn common_prefix_bundles(per_node: Vec<Vec<IncomingBundle>>) -> Vec<IncomingBundle> {
+    let Some((first, rest)) = per_node.split_first() else {
+        return Vec::new();
+    };
+    // Group each node's bundles by origin, preserving each origin's cursor order.
+    let group = |bundles: &[IncomingBundle]| -> BTreeMap<ChainId, Vec<IncomingBundle>> {
+        let mut by_origin: BTreeMap<ChainId, Vec<IncomingBundle>> = BTreeMap::new();
+        for bundle in bundles {
+            by_origin.entry(bundle.origin).or_default().push(bundle.clone());
+        }
+        by_origin
+    };
+    let base = group(first);
+    let others: Vec<_> = rest.iter().map(|node| group(node)).collect();
+    let mut result = Vec::new();
+    for (origin, base_bundles) in base {
+        let mut prefix_len = base_bundles.len();
+        for other in &others {
+            let other_bundles = other.get(&origin).map_or(&[][..], Vec::as_slice);
+            let matching = base_bundles
+                .iter()
+                .zip(other_bundles)
+                .take_while(|(a, b)| a.bundle.cursor() == b.bundle.cursor())
+                .count();
+            prefix_len = prefix_len.min(matching);
+            if prefix_len == 0 {
+                break;
+            }
+        }
+        result.extend(base_bundles.into_iter().take(prefix_len));
+    }
+    result
 }
 
 /// Groups the given validator votes by the `ConfirmedBlock` value hash they attest to, and
@@ -759,10 +929,96 @@ fn find_confirming_quorum(
 
 #[cfg(test)]
 mod tests {
-    use linera_base::crypto::{AccountSecretKey, CryptoHash, ValidatorKeypair};
-    use linera_chain::data_types::{LiteValue, LiteVote};
+    use linera_base::{
+        crypto::{AccountSecretKey, CryptoHash, ValidatorKeypair},
+        data_types::BlockHeight,
+    };
+    use linera_chain::data_types::{LiteValue, LiteVote, MessageAction, MessageBundle};
 
     use super::*;
+
+    /// A pending bundle from `origin` whose cursor is `(height, index)`. The message list is
+    /// empty: `common_prefix_bundles` compares only cursors, so the contents are irrelevant.
+    fn bundle(origin: ChainId, height: u64, index: u32) -> IncomingBundle {
+        IncomingBundle {
+            origin,
+            bundle: MessageBundle {
+                height: BlockHeight(height),
+                timestamp: Timestamp::from(0),
+                certificate_hash: CryptoHash::test_hash("cert"),
+                transaction_index: index,
+                messages: Vec::new(),
+            },
+            action: MessageAction::Accept,
+        }
+    }
+
+    /// The bundles' cursors, sorted by (origin, height, index). Sorting makes comparisons
+    /// insensitive to the order origins are emitted in (which is irrelevant, since each origin's
+    /// inbox is drained independently) while still exposing any per-origin reordering, because
+    /// within an origin the expected cursors are already ascending.
+    fn cursors(bundles: &[IncomingBundle]) -> Vec<(ChainId, u64, u32)> {
+        let mut cursors: Vec<_> = bundles
+            .iter()
+            .map(|b| (b.origin, b.bundle.height.0, b.bundle.transaction_index))
+            .collect();
+        cursors.sort();
+        cursors
+    }
+
+    fn sorted(mut cursors: Vec<(ChainId, u64, u32)>) -> Vec<(ChainId, u64, u32)> {
+        cursors.sort();
+        cursors
+    }
+
+    #[test]
+    fn common_prefix_takes_the_agreed_per_origin_prefix() {
+        let a = ChainId(CryptoHash::test_hash("a"));
+        let b = ChainId(CryptoHash::test_hash("b"));
+
+        // No responders at all -> nothing to drain.
+        assert!(common_prefix_bundles(Vec::new()).is_empty());
+
+        // A single responder: everything it lists is included (grouped by origin, in order).
+        let only = vec![bundle(a, 0, 0), bundle(a, 1, 0), bundle(b, 0, 0)];
+        assert_eq!(
+            cursors(&common_prefix_bundles(vec![only.clone()])),
+            sorted(vec![(a, 0, 0), (a, 1, 0), (b, 0, 0)]),
+        );
+
+        // Two responders agreeing fully: the whole thing survives.
+        assert_eq!(
+            common_prefix_bundles(vec![only.clone(), only.clone()]).len(),
+            3
+        );
+
+        // One responder is one bundle behind on origin `a`: only the shared prefix of `a`
+        // survives, and origin `b`, present in both, is kept.
+        let ahead = vec![bundle(a, 0, 0), bundle(a, 1, 0), bundle(b, 0, 0)];
+        let behind = vec![bundle(a, 0, 0), bundle(b, 0, 0)];
+        assert_eq!(
+            cursors(&common_prefix_bundles(vec![ahead, behind])),
+            sorted(vec![(a, 0, 0), (b, 0, 0)]),
+        );
+
+        // The lists diverge mid-origin (a different cursor at index 1): the prefix stops at the
+        // divergence, and nothing past it is included even though later cursors happen to match.
+        let left = vec![bundle(a, 0, 0), bundle(a, 1, 0), bundle(a, 2, 0)];
+        let right = vec![bundle(a, 0, 0), bundle(a, 5, 0), bundle(a, 2, 0)];
+        assert_eq!(
+            cursors(&common_prefix_bundles(vec![left, right])),
+            vec![(a, 0, 0)],
+        );
+
+        // An origin missing from one responder contributes nothing, but other shared origins
+        // are unaffected.
+        let with_b = vec![bundle(a, 0, 0), bundle(b, 0, 0)];
+        let without_b = vec![bundle(a, 0, 0)];
+        assert_eq!(
+            cursors(&common_prefix_bundles(vec![with_b, without_b])),
+            vec![(a, 0, 0)],
+        );
+    }
 
     fn committee_of(size: usize) -> (Committee, Vec<ValidatorPublicKey>) {
         let keys: Vec<_> = (0..size)
