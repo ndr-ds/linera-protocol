@@ -1,6 +1,12 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// `ClientMode::Full`'s deeply generic, deeply nested async call chain (Client<FullEnv> ->
+// ChainClient -> RequestsScheduler -> ...) overflows the default recursion limit while the
+// compiler proves the futures spawned in `run_chain` are `Send`. Not a real recursion --
+// just more type-checking headroom than the default budget.
+#![recursion_limit = "512"]
+
 //! A lightweight benchmark client that spams transactions through real consensus without
 //! running a full node.
 //!
@@ -50,11 +56,16 @@ use linera_chain::{
 };
 use linera_client::benchmark::{NativeFungibleTransferGenerator, OperationGenerator};
 use linera_core::{
-    data_types::ChainInfoQuery,
+    client::chain_client,
+    data_types::{ChainInfoQuery, ClientOutcome},
+    environment,
     node::{CrossChainMessageDelivery, ValidatorNode, ValidatorNodeProvider as _},
+    remote_node::RemoteNode,
 };
-use linera_execution::committee::Committee;
+use linera_execution::{committee::Committee, Operation};
 use linera_rpc::{node_provider::DEFAULT_MAX_BACKOFF, Client, NodeOptions, NodeProvider};
+use linera_storage::{DbStorage, StorageCacheConfig, WallClock};
+use linera_views::backends::memory::{MemoryDatabase, MemoryStoreConfig};
 use linera_wallet_json::{Keystore, PersistentWallet};
 use num_format::{Locale, ToFormattedString as _};
 use rand::Rng as _;
@@ -74,6 +85,30 @@ enum TrafficMode {
     /// Every transfer goes to another benchmarked chain, chosen at random; never to self.
     Full,
 }
+
+/// Which client drives the benchmark: see the module doc comment for the RTT-count
+/// difference between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ClientMode {
+    /// The default: no local storage or execution, 3 round trips per block.
+    Lite,
+    /// A real `ChainClient` backed by local in-memory storage: executes every block itself
+    /// (native operations only -- no WASM runtime is set up), 2 round trips per block.
+    /// Currently only supports `--traffic-mode independent`.
+    Full,
+}
+
+/// The `Environment` for `ClientMode::Full`: a real, in-process `ChainClient`, backed by
+/// local in-memory storage rather than nothing (`LiteChainClient`) or a remote validator's
+/// storage. `NodeProvider` already implements `ValidatorNodeProvider`, which is all
+/// `environment::Network` requires, so it's reused as-is from the lite client's own setup.
+type FullEnv = environment::Impl<
+    DbStorage<MemoryDatabase, WallClock>,
+    NodeProvider,
+    InMemorySigner,
+    environment::wallet::Memory,
+>;
+type FullChainClient = chain_client::ChainClient<FullEnv>;
 
 #[derive(clap::Parser)]
 #[command(
@@ -146,6 +181,20 @@ struct Args {
     #[arg(long)]
     max_incoming_bundles_per_block: Option<usize>,
 
+    /// Broadcast the confirmed certificate's compact, value-free form (hash + signatures) to
+    /// each validator known to have voted for it, instead of the full certificate (which
+    /// re-embeds the whole executed block). A validator that already voted has the value
+    /// cached, so this only shrinks the third and final round trip's payload; a validator that
+    /// fell behind and forgot the value transparently gets a retry with the full certificate
+    /// (see `RemoteNode::handle_optimized_confirmed_certificate`). Off by default.
+    #[arg(long)]
+    light_certificates: bool,
+
+    /// Which client drives the benchmark -- lite (default, 3 RTTs/block) or full (2
+    /// RTTs/block, real local execution). See `ClientMode`'s doc comment.
+    #[arg(long, value_enum, default_value_t = ClientMode::Lite)]
+    client_mode: ClientMode,
+
     /// Send every transfer in a block to the same destination chain (chosen fresh each block),
     /// instead of letting each transfer pick its own destination. All of a block's cross-chain
     /// messages then land in one recipient's inbox as a run of separate single-message bundles.
@@ -174,12 +223,41 @@ struct Args {
     /// `transfers.csv` schema.
     #[arg(long)]
     output_csv: Option<PathBuf>,
+
+    /// The number of Tokio worker threads to use. Defaults to the number of CPUs, like a bare
+    /// `#[tokio::main]` -- fine for a single client process, but this client is normally run
+    /// many-to-a-machine (one OS process per --num-clients in run_lite_benchmark_parallel.sh),
+    /// and each process's chain tasks are I/O-bound (waiting on the network), not CPU-bound, so
+    /// they don't need a full core's worth of threads each. At high client counts on a modest
+    /// machine, N processes defaulting to num_cpus threads apiece can oversubscribe the host by
+    /// an order of magnitude, adding scheduling jitter that shows up as client-observed tail
+    /// latency indistinguishable from real network/validator latency. Set this low (e.g. 2) when
+    /// running many clients per machine.
+    #[arg(long)]
+    tokio_threads: Option<usize>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    linera_service::tracing::init("lite-benchmark");
+fn main() -> Result<()> {
     let args = Args::parse();
+
+    let mut builder = if args.tokio_threads == Some(1) {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(threads) = args.tokio_threads {
+            builder.worker_threads(threads);
+        }
+        builder
+    };
+    builder
+        .enable_all()
+        .build()
+        .context("failed to create the Tokio runtime")?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
+    linera_service::tracing::init("lite-benchmark");
 
     let wallet = PersistentWallet::read(&args.wallet).context("failed to read the wallet")?;
     let keystore = Keystore::read(&args.keystore).context("failed to read the keystore")?;
@@ -216,6 +294,82 @@ async fn main() -> Result<()> {
         args.traffic_mode
     );
 
+    // For ClientMode::Full, one Client<FullEnv> is shared by every chain this process drives:
+    // it owns the local in-memory storage and the in-memory wallet those chains' ChainClients
+    // read/write through. Built once, up front, rather than per chain.
+    let full_client: Option<Arc<linera_core::client::Client<FullEnv>>> =
+        if args.client_mode == ClientMode::Full {
+            anyhow::ensure!(
+                matches!(args.traffic_mode, TrafficMode::Independent),
+                "--client-mode full currently only supports --traffic-mode independent"
+            );
+            let mut storage = DbStorage::<MemoryDatabase, WallClock>::maybe_create_and_connect(
+                &MemoryStoreConfig { kill_on_drop: true },
+                "lite-benchmark-full-client",
+                None,
+                StorageCacheConfig {
+                    blob_cache_size: 1000,
+                    confirmed_block_cache_size: 1000,
+                    certificate_cache_size: 1000,
+                    certificate_raw_cache_size: 1000,
+                    event_cache_size: 1000,
+                    block_hash_by_height_cache_size: 1000,
+                    event_block_height_cache_size: 1000,
+                    cache_cleanup_interval_secs: 3600,
+                },
+            )
+            .await
+            .context("failed to set up local in-memory storage for the full client")?;
+            wallet
+                .genesis_config()
+                .initialize_storage(&mut storage)
+                .await
+                .context("failed to initialize local storage from genesis")?;
+            let environment = environment::Impl {
+                storage,
+                network: node_provider.clone(),
+                signer: signer.clone(),
+                wallet: environment::wallet::Memory::default(),
+            };
+            let chain_client_options = chain_client::Options {
+                max_pending_message_bundles: 10,
+                max_block_limit_errors: 3,
+                staging_bundles_time_budget: None,
+                message_policy: Default::default(),
+                priority_bundle_origins: HashSet::new(),
+                cross_chain_message_delivery: CrossChainMessageDelivery::NonBlocking,
+                quorum_grace_period: 0.1,
+                blob_download_hedge_delay: Duration::from_secs(1),
+                certificate_batch_download_hedge_delay: Duration::from_secs(1),
+                certificate_download_batch_size: 1000,
+                certificate_upload_batch_size: 1000,
+                sender_certificate_download_batch_size: 1000,
+                max_concurrent_batch_downloads: 10,
+                max_joined_tasks: 100,
+                allow_fast_blocks: false,
+                notification_circuit_breaker_initial_probe_interval: Duration::from_secs(300),
+                notification_circuit_breaker_max_probe_interval: Duration::from_secs(3600),
+                max_event_stream_queries: 100,
+            };
+            let client = linera_core::client::Client::new(
+                environment,
+                wallet.genesis_config().admin_chain_id(),
+                false,
+                vec![],
+                "lite-benchmark-full",
+                None,
+                None,
+                10,
+                chain_client_options,
+                1000,
+                1000,
+                &Default::default(),
+            );
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
     let mut chain_clients = Vec::new();
     for chain_id in chain_ids {
         let owner = wallet
@@ -226,16 +380,39 @@ async fn main() -> Result<()> {
             signer.contains_key(&owner).await.unwrap_or(false),
             "the keystore has no key for owner {owner} of chain {chain_id}"
         );
-        let client = LiteChainClient::seed(
-            chain_id,
-            owner,
-            nodes.clone(),
-            committee.clone(),
-            signer.clone(),
-        )
-        .await
-        .with_context(|| format!("failed to seed the initial state for chain {chain_id}"))?;
-        chain_clients.push(client);
+        let client = match &full_client {
+            Some(full_client) => {
+                let chain_client = full_client.create_chain_client(
+                    chain_id,
+                    None,
+                    linera_base::data_types::BlockHeight(0),
+                    &None,
+                    Some(owner),
+                    None,
+                    false,
+                );
+                chain_client
+                    .prepare_chain()
+                    .await
+                    .with_context(|| format!("failed to prepare chain {chain_id}"))?;
+                AnyChainClient::Full(chain_client)
+            }
+            None => AnyChainClient::Lite(
+                LiteChainClient::seed(
+                    chain_id,
+                    owner,
+                    nodes.clone(),
+                    committee.clone(),
+                    signer.clone(),
+                    args.light_certificates,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to seed the initial state for chain {chain_id}")
+                })?,
+            ),
+        };
+        chain_clients.push((client, chain_id, owner));
     }
 
     let shutdown = CancellationToken::new();
@@ -301,13 +478,11 @@ async fn main() -> Result<()> {
     }
 
     let mut join_set = task::JoinSet::new();
-    for client in chain_clients {
+    for (client, chain_id, owner) in chain_clients {
         let current_bps = current_bps.clone();
         let shutdown = shutdown.clone();
         let success_count = success_count.clone();
         let failure_count = failure_count.clone();
-        let owner = client.owner;
-        let chain_id = client.chain_id;
         // Build the destination list and self-avoidance for the requested traffic mode. See
         // `TrafficMode`'s doc comments for the semantics of each variant.
         let (destinations, avoid_self) = match args.traffic_mode {
@@ -362,6 +537,7 @@ async fn main() -> Result<()> {
         let process_messages = !matches!(args.traffic_mode, TrafficMode::Independent);
         join_set.spawn(run_chain(
             client,
+            chain_id,
             generator,
             owner,
             current_bps,
@@ -431,7 +607,10 @@ fn parse_bps_schedule(spec: &str) -> Result<Vec<(u64, usize)>> {
     }
     schedule.sort_by_key(|(offset, _)| *offset);
     anyhow::ensure!(!schedule.is_empty(), "--bps-schedule must not be empty");
-    anyhow::ensure!(schedule[0].0 == 0, "--bps-schedule's first offset must be 0");
+    anyhow::ensure!(
+        schedule[0].0 == 0,
+        "--bps-schedule's first offset must be 0"
+    );
     Ok(schedule)
 }
 
@@ -513,9 +692,50 @@ impl BlockSizer {
     }
 }
 
+/// Either client type `run_chain` can drive, dispatching each block to whichever one it
+/// holds. See the module doc comment and `ClientMode` for the difference between them.
+enum AnyChainClient {
+    Lite(LiteChainClient),
+    Full(FullChainClient),
+}
+
+impl AnyChainClient {
+    /// Proposes and commits one block. `process_messages`/`bundle_cap` only apply to the lite
+    /// client; the full client relies on `ChainClient`'s own inbox handling, and is currently
+    /// only used with `--traffic-mode independent`, which never has bundles to drain (see
+    /// `ClientMode::Full`'s doc comment).
+    async fn propose_and_commit(
+        &mut self,
+        operations: Vec<Operation>,
+        process_messages: bool,
+        bundle_cap: usize,
+    ) -> Result<usize> {
+        match self {
+            AnyChainClient::Lite(client) => {
+                client
+                    .propose_and_commit(operations, process_messages, bundle_cap)
+                    .await
+            }
+            AnyChainClient::Full(client) => {
+                match client.execute_operations(operations, vec![]).await {
+                    Ok(ClientOutcome::Committed(_)) => Ok(0),
+                    Ok(ClientOutcome::WaitForTimeout(_)) => {
+                        Err(anyhow!("block did not commit: waiting for a round timeout"))
+                    }
+                    Ok(ClientOutcome::Conflict(_)) => Err(anyhow!(
+                        "block did not commit: another block was committed first"
+                    )),
+                    Err(error) => Err(anyhow!("{error}")),
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chain(
-    mut client: LiteChainClient,
+    mut client: AnyChainClient,
+    chain_id: ChainId,
     mut generator: NativeFungibleTransferGenerator,
     owner: AccountOwner,
     current_bps: Arc<AtomicUsize>,
@@ -538,7 +758,6 @@ async fn run_chain(
         time::sleep(de_sync_sleep).await;
     }
 
-    let chain_id = client.chain_id;
     let mut records = Vec::new();
     // The target rate can change over time (--bps-schedule), so the ticker is rebuilt
     // whenever it does; `tokio::time::interval` is kept (rather than a plain per-iteration
@@ -634,6 +853,9 @@ struct LiteChainClient {
     /// blocks so that draining costs no extra round trip; empty before the first block and in
     /// `independent` mode.
     pending_bundles: Vec<IncomingBundle>,
+    /// Whether to broadcast the confirmed certificate in its compact, value-free form where
+    /// possible (see `--light-certificates`).
+    light_certificates: bool,
 }
 
 impl LiteChainClient {
@@ -644,6 +866,7 @@ impl LiteChainClient {
         nodes: Vec<(ValidatorPublicKey, Client)>,
         committee: Committee,
         signer: InMemorySigner,
+        light_certificates: bool,
     ) -> Result<Self> {
         for (public_key, node) in &nodes {
             let query = ChainInfoQuery::new(chain_id);
@@ -661,6 +884,7 @@ impl LiteChainClient {
                         signer,
                         value_cache: ValueCache::new("lite-benchmark", 64, 60),
                         pending_bundles: Vec::new(),
+                        light_certificates,
                     });
                 }
                 Err(error) => {
@@ -693,7 +917,11 @@ impl LiteChainClient {
         bundle_cap: usize,
     ) -> Result<usize> {
         let bundles: Vec<IncomingBundle> = if process_messages {
-            self.pending_bundles.iter().take(bundle_cap).cloned().collect()
+            self.pending_bundles
+                .iter()
+                .take(bundle_cap)
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };
@@ -731,15 +959,18 @@ impl LiteChainClient {
             async move { (public_key, node.handle_block_proposal(proposal).await) }
         }))
         .await;
-        let votes = responses.into_iter().filter_map(|(public_key, result)| match result {
-            Ok(response) => response.info.manager.pending.map(|vote| (public_key, vote)),
-            Err(error) => {
-                warn!(%public_key, %error, "validator rejected the block proposal");
-                None
-            }
-        });
-        let (value_hash, signatures) = find_confirming_quorum(self.chain_id, votes, &self.committee)
-            .context("no quorum of validators voted to confirm the proposed block")?;
+        let votes = responses
+            .into_iter()
+            .filter_map(|(public_key, result)| match result {
+                Ok(response) => response.info.manager.pending.map(|vote| (public_key, vote)),
+                Err(error) => {
+                    warn!(%public_key, %error, "validator rejected the block proposal");
+                    None
+                }
+            });
+        let (value_hash, signatures) =
+            find_confirming_quorum(self.chain_id, votes, &self.committee)
+                .context("no quorum of validators voted to confirm the proposed block")?;
 
         // Fetch the confirmed value (with its real execution outcome) instead of executing the
         // block ourselves, and -- folded into the same round trip -- the inboxes' pending
@@ -759,7 +990,8 @@ impl LiteChainClient {
             None,
             signatures,
         );
-        let certificate = ConfirmedBlockCertificate::from_parts(quorum, JustificationChain::default());
+        let certificate =
+            ConfirmedBlockCertificate::from_parts(quorum, JustificationChain::default());
         let cached_certificate = self
             .value_cache
             .insert(&certificate.hash(), certificate.clone());
@@ -767,15 +999,39 @@ impl LiteChainClient {
         // Broadcast the certificate so every validator commits the block. Only advance our own
         // state once at least one validator actually accepted it, so we don't get out of sync
         // with the chain if the certificate is rejected everywhere.
-        let results = join_all(self.nodes.iter().map(|(_, node)| {
+        //
+        // With --light-certificates, prefer sending each validator just the certificate's hash
+        // and signatures (no block value) via RemoteNode::handle_optimized_confirmed_certificate
+        // -- every validator here voted on this block in the first round trip, so it already has
+        // the value cached and can reconstruct the full certificate locally. A validator that
+        // fell behind and forgot the value it signed gets a transparent fallback to the full
+        // certificate (see that method's doc comment). This only shrinks this round trip's
+        // payload; it doesn't remove it.
+        let light_certificates = self.light_certificates;
+        let results = join_all(self.nodes.iter().map(|(public_key, node)| {
             let node = node.clone();
             let cached_certificate = cached_certificate.clone();
             async move {
-                node.handle_confirmed_certificate(
-                    cached_certificate,
-                    CrossChainMessageDelivery::NonBlocking,
-                )
-                .await
+                if light_certificates {
+                    let remote_node = RemoteNode {
+                        public_key: *public_key,
+                        node,
+                    };
+                    remote_node
+                        .handle_optimized_confirmed_certificate(
+                            &cached_certificate,
+                            CrossChainMessageDelivery::NonBlocking,
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    node.handle_confirmed_certificate(
+                        cached_certificate,
+                        CrossChainMessageDelivery::NonBlocking,
+                    )
+                    .await
+                    .map(|_| ())
+                }
             }
         }))
         .await;
@@ -882,7 +1138,10 @@ fn common_prefix_bundles(per_node: Vec<Vec<IncomingBundle>>) -> Vec<IncomingBund
     let group = |bundles: &[IncomingBundle]| -> BTreeMap<ChainId, Vec<IncomingBundle>> {
         let mut by_origin: BTreeMap<ChainId, Vec<IncomingBundle>> = BTreeMap::new();
         for bundle in bundles {
-            by_origin.entry(bundle.origin).or_default().push(bundle.clone());
+            by_origin
+                .entry(bundle.origin)
+                .or_default()
+                .push(bundle.clone());
         }
         by_origin
     };
@@ -932,7 +1191,9 @@ fn find_confirming_quorum(
         let weight = weight_by_hash.entry(hash).or_insert(0);
         *weight += committee.weight(&public_key);
         if *weight >= committee.quorum_threshold() {
-            let signatures = signatures_by_hash.remove(&hash).expect("just inserted above");
+            let signatures = signatures_by_hash
+                .remove(&hash)
+                .expect("just inserted above");
             return Some((hash, signatures));
         }
     }

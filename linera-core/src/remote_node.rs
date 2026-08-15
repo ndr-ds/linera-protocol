@@ -29,7 +29,9 @@ use crate::{
 /// A validator node together with the validator's name.
 #[derive(Clone, Debug)]
 pub struct RemoteNode<N> {
+    /// The validator's public key.
     pub public_key: ValidatorPublicKey,
+    /// The client used to communicate with the validator.
     #[debug(skip)]
     pub node: N,
 }
@@ -110,7 +112,12 @@ impl<N: ValidatorNode> RemoteNode<N> {
         self.handle_validated_certificate(certificate.clone()).await
     }
 
-    pub(crate) async fn handle_optimized_confirmed_certificate(
+    /// Sends the certificate to this validator, preferring the compact lite form (hash +
+    /// signatures, no block value) when the validator is known to have signed it -- and thus
+    /// already has the value cached -- falling back to the full certificate otherwise (a
+    /// validator that fell behind and forgot the value it signed returns
+    /// [`NodeError::MissingCertificateValue`], handled transparently here).
+    pub async fn handle_optimized_confirmed_certificate(
         &self,
         certificate: &CacheArc<ConfirmedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
@@ -198,6 +205,7 @@ impl<N: ValidatorNode> RemoteNode<N> {
         Ok(())
     }
 
+    /// Downloads the blob with the given ID from this validator, if it has one.
     #[instrument(level = "trace")]
     pub async fn download_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, NodeError> {
         match self.node.download_blob(blob_id).await {
