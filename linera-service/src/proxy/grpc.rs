@@ -41,8 +41,8 @@ use linera_rpc::{
             SubscriptionRequest, VersionInfo,
         },
         pool::GrpcConnectionPool,
-        GrpcProtoConversionError, GrpcProxyable, GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
-        GRPC_MAX_MESSAGE_SIZE,
+        retry_shard_from_status, GrpcProtoConversionError, GrpcProxyable,
+        GRPC_CHUNKED_MESSAGE_FILL_LIMIT, GRPC_MAX_MESSAGE_SIZE,
     },
     routing::ShardRouter,
 };
@@ -215,6 +215,31 @@ struct GrpcProxyInner<S> {
     router: ShardRouter,
 }
 
+/// Forwards `$inner` to `$client`, retrying once directly against the
+/// authoritative shard if the worker rejects it as a stale double-forward
+/// (i.e. its own single-hop forward landed on a worker whose routing was also
+/// stale -- see `linera_rpc::grpc::server::route`'s doc comment).
+macro_rules! forward_with_retry {
+    ($self:expr, $client:expr, $method:ident, $inner:expr) => {{
+        let __inner = $inner;
+        match $client
+            .$method(Self::create_forwarding_request(__inner.clone()))
+            .await
+        {
+            Err(status) => match retry_shard_from_status(&status) {
+                Some(shard_id) => {
+                    $self
+                        .worker_client_for_shard_id(shard_id)?
+                        .$method(Self::create_forwarding_request(__inner))
+                        .await
+                }
+                None => Err(status),
+            },
+            ok => ok,
+        }
+    }};
+}
+
 impl<S> GrpcProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -326,6 +351,18 @@ where
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE);
 
         Ok(client)
+    }
+
+    /// Connects directly to a shard by ID, for retrying a forward against the
+    /// authoritative shard named in a rejected request (see
+    /// [`retry_shard_from_status`]).
+    fn worker_client_for_shard_id(
+        &self,
+        shard_id: usize,
+    ) -> Result<ValidatorWorkerClient<Channel>, Status> {
+        let shard = self.0.internal_config.shard(shard_id).clone();
+        self.worker_client_for_shard(&shard)
+            .map_err(|_| Status::internal("could not connect to shard"))
     }
 
     /// Runs the proxy. If either the public server or private server dies for whatever
@@ -506,9 +543,7 @@ where
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_block_proposal(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_block_proposal, inner)
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_lite_certificate"))]
@@ -517,9 +552,7 @@ where
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_lite_certificate(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_lite_certificate, inner)
     }
 
     #[instrument(
@@ -532,9 +565,7 @@ where
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_confirmed_certificate(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_confirmed_certificate, inner)
     }
 
     #[instrument(
@@ -547,9 +578,7 @@ where
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_validated_certificate(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_validated_certificate, inner)
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_timeout_certificate"))]
@@ -558,9 +587,7 @@ where
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_timeout_certificate(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_timeout_certificate, inner)
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_chain_info_query"))]
@@ -569,9 +596,7 @@ where
         request: Request<api::ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client
-            .handle_chain_info_query(Self::create_forwarding_request(inner))
-            .await
+        forward_with_retry!(self, client, handle_chain_info_query, inner)
     }
 
     #[instrument(skip_all, err(Display), fields(method = "subscribe"))]
@@ -694,7 +719,17 @@ where
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client.download_pending_blob(inner).await
+        match client.download_pending_blob(inner.clone()).await {
+            Err(status) => match retry_shard_from_status(&status) {
+                Some(shard_id) => {
+                    self.worker_client_for_shard_id(shard_id)?
+                        .download_pending_blob(inner)
+                        .await
+                }
+                None => Err(status),
+            },
+            ok => ok,
+        }
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_pending_blob"))]
@@ -703,7 +738,17 @@ where
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
-        client.handle_pending_blob(inner).await
+        match client.handle_pending_blob(inner.clone()).await {
+            Err(status) => match retry_shard_from_status(&status) {
+                Some(shard_id) => {
+                    self.worker_client_for_shard_id(shard_id)?
+                        .handle_pending_blob(inner)
+                        .await
+                }
+                None => Err(status),
+            },
+            ok => ok,
+        }
     }
 
     #[instrument(skip_all, err(Display), fields(method = "download_certificate"))]

@@ -54,6 +54,49 @@ use crate::{
 /// worker routing tables are temporarily inconsistent during a migration.
 const FORWARDED_METADATA_KEY: &str = "x-linera-forwarded";
 
+/// Metadata key carrying the authoritative shard ID on a rejected double-forward
+/// (see [`GrpcServer::route`]), so the immediate caller can retry once directly
+/// against that shard instead of giving up. Exposed crate-externally (via `pub
+/// use server::*;` in `grpc/mod.rs`) so `linera-service`'s proxy can apply the
+/// same retry-once behavior on its own forwarding path.
+pub const RETRY_SHARD_METADATA_KEY: &str = "x-linera-retry-shard";
+
+/// Extracts the authoritative shard ID from a rejected double-forward, if the
+/// status carries one (see [`GrpcServer::route`]).
+pub fn retry_shard_from_status(status: &Status) -> Option<ShardId> {
+    status
+        .metadata()
+        .get(RETRY_SHARD_METADATA_KEY)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Forwards `$inner` to `$client`, retrying once directly against the
+/// authoritative shard if the target rejects it as a stale double-forward (see
+/// [`GrpcServer::route`]'s doc comment for why this retry is needed).
+macro_rules! forward_with_retry {
+    ($self:expr, $client:expr, $method:ident, $inner:expr) => {{
+        let __inner = $inner;
+        match $client
+            .$method(Self::forwarding_request(__inner.clone()))
+            .await
+        {
+            Err(status) => match retry_shard_from_status(&status) {
+                Some(shard_id) => {
+                    $self
+                        .worker_client_for_shard(shard_id)?
+                        .$method(Self::forwarding_request(__inner))
+                        .await
+                }
+                None => Err(status),
+            },
+            ok => ok,
+        }
+    }};
+}
+
 type CrossChainSender = mpsc::Sender<(linera_core::data_types::CrossChainRequest, ShardId)>;
 type NotificationSender = tokio::sync::broadcast::Sender<Notification>;
 
@@ -810,8 +853,10 @@ where
     /// chain's routing entry; the caller must hold it for the duration of
     /// request processing so that a concurrent migration waits for the request
     /// to complete. Otherwise returns a client connected to the owning worker,
-    /// unless the request was already forwarded once, in which case an error is
-    /// returned to the (worker) caller, which will retry with fresh routing.
+    /// unless the request was already forwarded once, in which case an error
+    /// carrying the authoritative shard ID (`RETRY_SHARD_METADATA_KEY`) is
+    /// returned to the (worker) caller, which retries once directly against
+    /// that shard (see the `forward_with_retry` macro).
     async fn route(&self, chain_id: ChainId, forwarded: bool) -> Result<Routed, Status> {
         let guard = self.router.read_guard(chain_id).await;
         let target = *guard;
@@ -825,11 +870,15 @@ where
         }
         drop(guard);
         if forwarded {
-            return Err(Status::failed_precondition(format!(
+            let mut status = Status::failed_precondition(format!(
                 "chain {chain_id} is not assigned to shard {} (currently routed to shard \
                  {target}); refusing to forward an already-forwarded request",
                 self.shard_id
-            )));
+            ));
+            if let Ok(value) = tonic::metadata::MetadataValue::try_from(target.to_string()) {
+                status.metadata_mut().insert(RETRY_SHARD_METADATA_KEY, value);
+            }
+            return Err(status);
         }
         trace!(
             %chain_id,
@@ -947,9 +996,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_block_proposal(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_block_proposal, inner);
             }
         };
         let proposal = inner.try_into()?;
@@ -994,9 +1041,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_lite_certificate(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_lite_certificate, inner);
             }
         };
         let HandleLiteCertRequest {
@@ -1055,9 +1100,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_confirmed_certificate(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_confirmed_certificate, inner);
             }
         };
         let HandleConfirmedCertificateRequest {
@@ -1115,9 +1158,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_validated_certificate(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_validated_certificate, inner);
             }
         };
         let HandleValidatedCertificateRequest { certificate } = inner.try_into()?;
@@ -1166,9 +1207,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_timeout_certificate(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_timeout_certificate, inner);
             }
         };
         let HandleTimeoutCertificateRequest { certificate } = inner.try_into()?;
@@ -1216,9 +1255,7 @@ where
         let _route_guard = match self.route(chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_chain_info_query(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_chain_info_query, inner);
             }
         };
         let query = inner.try_into()?;
@@ -1261,9 +1298,7 @@ where
         let _route_guard = match self.route(routed_chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .download_pending_blob(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, download_pending_blob, inner);
             }
         };
         let (chain_id, blob_id) = inner.try_into()?;
@@ -1307,9 +1342,7 @@ where
         let _route_guard = match self.route(routed_chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_pending_blob(Self::forwarding_request(inner))
-                    .await;
+                return forward_with_retry!(self, client, handle_pending_blob, inner);
             }
         };
         let (chain_id, blob_content) = inner.try_into()?;
@@ -1353,11 +1386,8 @@ where
         let _route_guard = match self.route(target_chain_id, forwarded).await? {
             Routed::Local(guard) => guard,
             Routed::Forward(mut client) => {
-                return client
-                    .handle_cross_chain_request(Self::forwarding_request(
-                        cross_chain_request.try_into()?,
-                    ))
-                    .await;
+                let request_body: CrossChainRequest = cross_chain_request.try_into()?;
+                return forward_with_retry!(self, client, handle_cross_chain_request, request_body);
             }
         };
         trace!(?cross_chain_request, "Handling cross-chain request");
