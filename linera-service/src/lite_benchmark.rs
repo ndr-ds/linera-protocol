@@ -777,7 +777,17 @@ async fn run_chain(
         if bps != ticking_at {
             ticking_at = bps;
             interval = if bps > 0.0 {
-                Some(time::interval(Duration::from_secs_f64(1.0 / bps)))
+                let mut new_interval = time::interval(Duration::from_secs_f64(1.0 / bps));
+                // The default (`Burst`) fires every missed tick back-to-back with no pacing
+                // gap once behind schedule, trying to catch up to the *original* schedule --
+                // fine when the target period has huge headroom over real block latency (as
+                // in every run before --simulated-latency-ms existed), but once real per-block
+                // latency approaches the target period, a single transient slowdown makes a
+                // chain burst-fire at far above its target rate, which slows other chains down
+                // too, which burst-fires them -- a thundering-herd feedback loop. `Delay` paces
+                // forward from whenever the last tick actually completed instead.
+                new_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+                Some(new_interval)
             } else {
                 None
             };
