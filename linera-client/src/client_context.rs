@@ -306,6 +306,7 @@ where
             retry_delay: options.retry_delay,
             max_retries: options.max_retries,
             max_backoff: options.max_backoff,
+            ..Default::default()
         });
         let chain_modes: Vec<_> = wallet
             .items()
@@ -427,6 +428,7 @@ impl<Env: Environment> ClientContext<Env> {
             retry_delay: self.retry_delay,
             max_retries: self.max_retries,
             max_backoff: self.max_backoff,
+            ..Default::default()
         }
     }
 

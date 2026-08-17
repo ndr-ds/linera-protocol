@@ -243,6 +243,7 @@ impl RunOptions {
             retry_delay: self.retry_delay,
             max_retries: self.max_retries,
             max_backoff: self.max_backoff,
+            ..Default::default()
         };
 
         if let Some(port) = self.metrics_port {

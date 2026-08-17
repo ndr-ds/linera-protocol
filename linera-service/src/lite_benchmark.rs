@@ -181,6 +181,16 @@ struct Args {
     #[arg(long)]
     max_incoming_bundles_per_block: Option<usize>,
 
+    /// In `mixed`/`full` traffic modes, still generate and send cross-chain messages as usual,
+    /// but never drain a chain's own inboxes into its blocks -- isolates the CPU cost of
+    /// *sending* messages (cross-chain routing/delivery) from the cost of *receiving* them
+    /// (verifying and applying incoming bundles as `ReceiveMessages` transactions), since both
+    /// are normally on at once whenever `process_messages` is true. Inboxes just grow unbounded
+    /// for the run's duration; fine for a short benchmark, not a realistic steady state. No
+    /// effect in `independent` mode, which never generates cross-chain messages either way.
+    #[arg(long)]
+    skip_message_processing: bool,
+
     /// Broadcast the confirmed certificate's compact, value-free form (hash + signatures) to
     /// each validator known to have voted for it, instead of the full certificate (which
     /// re-embeds the whole executed block). A validator that already voted has the value
@@ -235,6 +245,14 @@ struct Args {
     /// running many clients per machine.
     #[arg(long)]
     tokio_threads: Option<usize>,
+
+    /// Adds this many milliseconds of artificial delay before every gRPC request to a
+    /// validator, simulating a higher-latency (e.g. WAN) link than whatever the client and
+    /// validator actually measure between them. 0 (default) adds no delay. Useful for testing
+    /// whether a difference in round trips per block (e.g. --client-mode or
+    /// --light-certificates) matters more once each round trip is expensive.
+    #[arg(long, default_value_t = 0)]
+    simulated_latency_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -270,6 +288,7 @@ async fn run(args: Args) -> Result<()> {
         retry_delay: Duration::from_millis(200),
         max_retries: 10,
         max_backoff: DEFAULT_MAX_BACKOFF,
+        simulated_latency: Duration::from_millis(args.simulated_latency_ms),
     });
     let nodes: Vec<(ValidatorPublicKey, Client)> = node_provider
         .make_nodes(&committee)
@@ -533,8 +552,10 @@ async fn run(args: Args) -> Result<()> {
             .then(|| Duration::from_secs_f64(rand::random::<f64>() / per_chain_bps));
         // Only `independent` mode never produces cross-chain messages; in every other mode each
         // block drains this chain's inboxes so they don't grow without bound (see
-        // --max-incoming-bundles-per-block).
-        let process_messages = !matches!(args.traffic_mode, TrafficMode::Independent);
+        // --max-incoming-bundles-per-block) -- unless --skip-message-processing asks to isolate
+        // the sending side only.
+        let process_messages =
+            !matches!(args.traffic_mode, TrafficMode::Independent) && !args.skip_message_processing;
         join_set.spawn(run_chain(
             client,
             chain_id,
