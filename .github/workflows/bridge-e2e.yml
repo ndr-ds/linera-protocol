@@ -5,7 +5,7 @@ on:
   merge_group:
   workflow_dispatch:
   push:
-    branches: [ 'testnet_*' ]
+    branches: [ main, 'testnet_*' ]
 
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.run_id }}'
@@ -80,6 +80,7 @@ jobs:
         with:
           context: .
           file: ./docker/Dockerfile
+          target: tests
           tags: linera-test
           load: true
           build-args: |
