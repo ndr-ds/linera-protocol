@@ -876,7 +876,9 @@ where
                 self.shard_id
             ));
             if let Ok(value) = tonic::metadata::MetadataValue::try_from(target.to_string()) {
-                status.metadata_mut().insert(RETRY_SHARD_METADATA_KEY, value);
+                status
+                    .metadata_mut()
+                    .insert(RETRY_SHARD_METADATA_KEY, value);
             }
             return Err(status);
         }
