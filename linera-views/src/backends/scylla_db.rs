@@ -895,6 +895,7 @@ impl ReadableKeyValueStore for ScyllaDbStoreInternal {
             .collect::<Vec<_>>();
         let results: Vec<_> = stream::iter(handles)
             .buffered(self.max_concurrent_chunk_queries.get())
+            .take(self.max_concurrent_chunk_queries.get())
             .try_collect()
             .await?;
         Ok(results.into_iter().flatten().collect())
@@ -915,6 +916,7 @@ impl ReadableKeyValueStore for ScyllaDbStoreInternal {
             .collect::<Vec<_>>();
         let results: Vec<_> = stream::iter(handles)
             .buffered(self.max_concurrent_chunk_queries.get())
+            .take(self.max_concurrent_chunk_queries.get())
             .try_collect()
             .await?;
         Ok(results.into_iter().flatten().collect())
